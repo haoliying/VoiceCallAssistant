@@ -21,6 +21,7 @@ import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
@@ -288,12 +289,12 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  录音：").append(stateOf(Manifest.permission.RECORD_AUDIO));
         sb.append("  电话状态：").append(stateOf(Manifest.permission.READ_PHONE_STATE));
         sb.append("  接听电话：").append(stateOf(Manifest.permission.ANSWER_PHONE_CALLS));
-        sb.append("\n  通知使用权：").append(notif ? "已开启（来电姓名和接听都用它）" : "未开启（姓名和接听都要它）");
+        sb.append("\n  无障碍服务：").append(a11y ? "已开启（靠它点/划接听）" : "未开启（不开启就无法自动接听）");
+        sb.append("\n  通知使用权：").append(notif ? "已开启（优先用通知里的姓名和按钮）" : "未开启（拿不到姓名和通知按钮）");
         sb.append("\n建议开启：\n");
-        sb.append("  通话记录：").append(stateOf(Manifest.permission.READ_CALL_LOG));
+        sb.append("  通话记录：").append(stateOf(Manifest.permission.READ_CALL_LOG)).append("（用它补上联系人姓名）");
         sb.append("  拨打电话：").append(stateOf(Manifest.permission.CALL_PHONE));
-        sb.append("\n  无障碍服务：").append(a11y ? "已开启（接听/挂断更可靠）" : "未开启（接听/挂断的兜底）");
-        sb.append("  来电筛选：").append(IncomingCallScreeningService.isEnabled(this) ? "已开启" : "未开启");
+        sb.append("\n  来电筛选：").append(IncomingCallScreeningService.isEnabled(this) ? "已开启" : "未开启");
         tvPermissions.setText(sb.toString());
     }
 
@@ -321,8 +322,14 @@ public class MainActivity extends AppCompatActivity {
 
         if (!CallAccessibilityService.isEnabledInSettings(this)) {
             if (guidedSteps.add("accessibility")) {
-                toastLong("第 2 步：找到“语音助手挂断辅助”并开启，接听和挂断更可靠");
-                openAccessibilitySettings();
+                new AlertDialog.Builder(this)
+                        .setTitle("还差一步：无障碍服务")
+                        .setMessage("系统不允许第三方应用直接接听/挂断电话，必须在无障碍设置里打开"
+                                + "“语音助手挂断辅助”，应用才能替你点接听、划接听。\n\n"
+                                + "路径：无障碍 → 已下载的应用 → 语音助手挂断辅助 → 开启")
+                        .setPositiveButton("去开启", (dialog, which) -> openAccessibilitySettings())
+                        .setNegativeButton("稍后", null)
+                        .show();
             }
         }
     }

@@ -1,20 +1,29 @@
 package com.voiceassistant.app;
 
 import android.accessibilityservice.AccessibilityService;
+import android.accessibilityservice.GestureDescription;
 import android.content.ComponentName;
 import android.content.Context;
+import android.graphics.Path;
+import android.graphics.Rect;
+import android.os.Build;
 import android.provider.Settings;
 import android.text.TextUtils;
+import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
- * 可选的无障碍辅助服务。系统不提供“挂断电话”的公开接口，
- * 这里退一步：在通话界面上找到挂断按钮并点击。
+ * 无障碍辅助服务：系统不提供第三方“接听/挂断”的公开接口，
+ * 这里在通话界面上找到按钮并点击；点不动时用模拟手势（点按/上滑），
+ * 因为华为等 ROM 的来电界面是滑动接听的。
  * 只有用户手动在系统设置里开启后才会工作。
  */
 public class CallAccessibilityService extends AccessibilityService {
@@ -26,10 +35,15 @@ public class CallAccessibilityService extends AccessibilityService {
     };
 
     private static final String[] ANSWER_LABELS = {
-            "接听", "接听电话", "接电话", "应答", "answer", "accept"
+            "接听", "接听电话", "接听来电", "接电话", "应答", "滑动接听", "上滑接听",
+            "answer", "accept"
     };
 
+    /** 上/下滑之间至少隔这么久，避免连续手势把界面越划越乱。 */
+    private static final long SWIPE_COOLDOWN_MS = 2500L;
+
     private static volatile CallAccessibilityService instance;
+    private static volatile long lastSwipeAt = 0L;
 
     public static boolean isRunning() {
         return instance != null;
@@ -48,71 +62,113 @@ public class CallAccessibilityService extends AccessibilityService {
         return false;
     }
 
-    /** 请求点击通话界面上的挂断按钮。 */
+    /** 请求点击/滑动挂断。 */
     static boolean clickHangUp() {
-        return clickLabels(HANG_UP_LABELS, "hang up");
+        if (clickLabels(HANG_UP_LABELS, "挂断")) return true;
+        return swipeGesture(false);
     }
 
-    /** 请求点击来电界面上的接听按钮（部分系统会拦截第三方接听）。 */
+    /** 请求点击/上滑接听。 */
     static boolean clickAnswer() {
-        return clickLabels(ANSWER_LABELS, "answer");
+        if (clickLabels(ANSWER_LABELS, "接听")) return true;
+        return swipeGesture(true);
     }
 
     private static boolean clickLabels(String[] labels, String what) {
         CallAccessibilityService service = instance;
-        if (service == null) return false;
+        if (service == null) {
+            LogStore.append("[无障碍] 服务未运行，无法" + what);
+            return false;
+        }
         try {
-            AccessibilityNodeInfo root = service.getRootInActiveWindow();
-            if (root != null && service.clickInTree(root, labels)) {
-                Log.i(TAG, what + " clicked in active window");
-                return true;
+            List<AccessibilityNodeInfo> nodes = service.find(labels);
+            if (nodes.isEmpty()) {
+                LogStore.append("[无障碍] 界面上没找到“" + what + "”按钮；窗口: "
+                        + service.describeWindows());
+                return false;
             }
-            List<android.view.accessibility.AccessibilityWindowInfo> windows = service.getWindows();
-            if (windows != null) {
-                for (android.view.accessibility.AccessibilityWindowInfo window : windows) {
-                    AccessibilityNodeInfo windowRoot = window.getRoot();
-                    if (windowRoot != null && service.clickInTree(windowRoot, labels)) {
-                        Log.i(TAG, what + " clicked in window " + window.getId());
-                        return true;
-                    }
+            for (AccessibilityNodeInfo node : nodes) {
+                if (service.click(node)) {
+                    LogStore.append("[无障碍] 已点击“" + what + "”按钮");
+                    return true;
                 }
             }
+            // 按钮本身不可点击（滑动接听），按它的位置点一下
+            for (AccessibilityNodeInfo node : nodes) {
+                Rect bounds = new Rect();
+                node.getBoundsInScreen(bounds);
+                if (bounds.width() > 0 && bounds.height() > 0
+                        && service.tap(bounds.centerX(), bounds.centerY())) {
+                    LogStore.append("[无障碍] 已点按“" + what + "”按钮位置");
+                    return true;
+                }
+            }
+            LogStore.append("[无障碍] 找到“" + what + "”按钮但点不动，改用滑动");
         } catch (Exception e) {
             Log.w(TAG, "click " + what + " failed", e);
         }
         return false;
     }
 
-    private boolean clickInTree(AccessibilityNodeInfo root, String[] labels) {
+    /** 当前可见窗口的简要信息，用来排查“找不到按钮”时到底是什么界面。 */
+    private String describeWindows() {
+        StringBuilder sb = new StringBuilder();
+        List<AccessibilityWindowInfo> windows = getWindows();
+        if (windows == null || windows.isEmpty()) return "无";
+        int count = 0;
+        for (AccessibilityWindowInfo window : windows) {
+            if (count++ >= 4) break;
+            if (sb.length() > 0) sb.append(" / ");
+            AccessibilityNodeInfo root = window.getRoot();
+            sb.append("type=").append(window.getType());
+            if (root != null) {
+                sb.append(" ").append(root.getPackageName()).append(":")
+                        .append(root.getClassName());
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 收集所有窗口里文字/描述/资源名匹配的节点。 */
+    private List<AccessibilityNodeInfo> find(String[] labels) {
+        List<AccessibilityNodeInfo> result = new ArrayList<>();
         ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
-        queue.add(root);
+        AccessibilityNodeInfo active = getRootInActiveWindow();
+        if (active != null) queue.add(active);
+        List<AccessibilityWindowInfo> windows = getWindows();
+        if (windows != null) {
+            for (AccessibilityWindowInfo window : windows) {
+                AccessibilityNodeInfo root = window.getRoot();
+                if (root != null) queue.add(root);
+            }
+        }
         int guard = 0;
-        while (!queue.isEmpty() && guard++ < 400) {
+        while (!queue.isEmpty() && guard++ < 600) {
             AccessibilityNodeInfo node = queue.poll();
             if (node == null) continue;
-            if (matches(node, labels) && click(node)) return true;
-
+            if (matches(node, labels)) result.add(node);
             for (int i = 0; i < node.getChildCount(); i++) {
                 AccessibilityNodeInfo child = node.getChild(i);
                 if (child != null) queue.add(child);
             }
         }
-        return false;
+        return result;
     }
 
     private boolean matches(AccessibilityNodeInfo node, String[] labels) {
         CharSequence text = node.getText();
         CharSequence description = node.getContentDescription();
+        String viewId = node.getViewIdResourceName();
         for (String label : labels) {
             if (contains(text, label) || contains(description, label)) return true;
+            if (viewId != null && viewId.toLowerCase(Locale.ROOT).contains(label)) return true;
         }
         return false;
     }
 
     private boolean contains(CharSequence source, String label) {
         if (source == null) return false;
-        String value = source.toString().toLowerCase();
-        return value.contains(label);
+        return source.toString().toLowerCase(Locale.ROOT).contains(label);
     }
 
     /** 按钮本身不一定可点，往上找最近的可点击父节点。 */
@@ -127,16 +183,59 @@ public class CallAccessibilityService extends AccessibilityService {
         return node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
     }
 
+    /** 在指定位置点一下（模拟手指触摸）。 */
+    private boolean tap(int x, int y) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return false;
+        Path path = new Path();
+        path.moveTo(x, y);
+        return dispatch(path, 60);
+    }
+
+    /**
+     * 接听界面是上滑接听、下滑拒接时，按屏幕中下方的滑动来操作。
+     * 每 2.5 秒最多一次，避免连续滑动把界面弄得不可控。
+     */
+    private static boolean swipeGesture(boolean up) {
+        CallAccessibilityService service = instance;
+        if (service == null) return false;
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - lastSwipeAt < SWIPE_COOLDOWN_MS) return false;
+        lastSwipeAt = now;
+        try {
+            DisplayMetrics metrics = service.getResources().getDisplayMetrics();
+            int x = metrics.widthPixels / 2;
+            int fromY = (int) (metrics.heightPixels * (up ? 0.82f : 0.30f));
+            int toY = (int) (metrics.heightPixels * (up ? 0.40f : 0.70f));
+            Path path = new Path();
+            path.moveTo(x, fromY);
+            path.lineTo(x, toY);
+            boolean sent = service.dispatch(path, 300);
+            LogStore.append("[无障碍] 已发送" + (up ? "上滑接听" : "下滑挂断") + "手势");
+            return sent;
+        } catch (Exception e) {
+            Log.w(TAG, "swipe failed", e);
+            return false;
+        }
+    }
+
+    private boolean dispatch(Path path, long durationMs) {
+        GestureDescription.StrokeDescription stroke =
+                new GestureDescription.StrokeDescription(path, 0, durationMs);
+        GestureDescription gesture = new GestureDescription.Builder().addStroke(stroke).build();
+        return dispatchGesture(gesture, null, null);
+    }
+
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
         instance = this;
         Log.i(TAG, "accessibility service connected");
+        LogStore.append("[无障碍] 服务已连接");
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // 只在收到请求时按需点击，不处理事件流
+        // 只在收到请求时按需操作，不处理事件流
     }
 
     @Override

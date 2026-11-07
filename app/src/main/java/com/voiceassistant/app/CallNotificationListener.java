@@ -207,7 +207,13 @@ public class CallNotificationListener extends NotificationListenerService {
             if (notification.tickerText != null) addText(texts, notification.tickerText);
 
             boolean hasAnswerAction = hasAnswerAction(notification);
-            if (!looksLikeCall(sbn, notification, texts, hasAnswerAction)) return;
+            if (!looksLikeCall(sbn, notification, texts, hasAnswerAction)) {
+                // 把“像来电但没采用”的通知也记下来，方便确认系统到底发了什么
+                if (isCallRelated(sbn, texts)) {
+                    LogStore.append("[通知] 未采用 " + describe(sbn, notification, texts));
+                }
+                return;
+            }
 
             if (notification.actions != null && notification.actions.length > 0) {
                 callActions = java.util.Arrays.asList(notification.actions);
@@ -245,6 +251,23 @@ public class CallNotificationListener extends NotificationListenerService {
         } catch (Exception e) {
             Log.w(TAG, "onNotificationPosted failed", e);
         }
+    }
+
+    /** 和来电有点关系、值得记一笔的通知（拨号进程、来电/接听字样、含号码）。 */
+    private static boolean isCallRelated(StatusBarNotification sbn, List<CharSequence> texts) {
+        String pkg = sbn.getPackageName();
+        String lower = pkg == null ? "" : pkg.toLowerCase(Locale.ROOT);
+        if (lower.contains("dialer") || lower.contains("telecom") || lower.contains("incallui")
+                || lower.contains("contacts") || lower.endsWith(".phone")) {
+            return true;
+        }
+        for (CharSequence text : texts) {
+            if (text == null) continue;
+            String value = text.toString();
+            if (value.contains("来电") || value.contains("接听") || value.contains("挂断")) return true;
+            if (PHONE_PATTERN.matcher(value).find()) return true;
+        }
+        return false;
     }
 
     private static boolean hasAnswerAction(Notification notification) {

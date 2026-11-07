@@ -1342,6 +1342,14 @@ public class VoiceService extends Service {
             } while (!destroyed && SystemClock.elapsedRealtime() < deadline
                     && callState == TelephonyManager.CALL_STATE_RINGING);
         }
+        // 来电通知读不到时，退一步用通话记录里系统缓存的姓名（华为会写入联系人名字）
+        if ((callerName == null || callerName.isEmpty()) && !callerNumber.isEmpty()) {
+            String fromCallLog = PhoneCallHelper.lookupNameFromCallLog(this, callerNumber);
+            if (fromCallLog != null && !fromCallLog.isEmpty()) {
+                callerName = fromCallLog;
+                broadcastDebug("[来电] 通话记录里读到姓名: " + fromCallLog);
+            }
+        }
 
         if (destroyed) return;
         if (!isPhoneStillRinging()) {

@@ -41,6 +41,43 @@ final class PhoneCallHelper {
     }
 
     /**
+     * 从通话记录里取系统缓存的姓名（华为会把联系人名字写进 CACHED_NAME）。
+     * 不需要通讯录权限，也不需要来电通知，号码对得上就能拿到名字。
+     */
+    static String lookupNameFromCallLog(Context context, String number) {
+        if (!hasPermission(context, Manifest.permission.READ_CALL_LOG)) return null;
+        String digits = number == null ? "" : number.replaceAll("[^0-9]", "");
+        if (digits.length() < 7) return null;
+        String suffix = digits.substring(digits.length() - 8);
+        android.database.Cursor cursor = null;
+        try {
+            cursor = context.getContentResolver().query(
+                    android.provider.CallLog.Calls.CONTENT_URI,
+                    new String[]{android.provider.CallLog.Calls.CACHED_NAME},
+                    android.provider.CallLog.Calls.NUMBER + " LIKE ?",
+                    new String[]{"%" + suffix},
+                    android.provider.CallLog.Calls.DATE + " DESC");
+            int scanned = 0;
+            while (cursor != null && cursor.moveToNext() && scanned++ < 30) {
+                String name = cursor.getString(0);
+                if (name == null) continue;
+                name = name.trim();
+                if (name.isEmpty()) continue;
+                // 有些记录里 CACHED_NAME 直接是号码
+                if (name.replaceAll("[^0-9]", "").equals(digits)) continue;
+                return name;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "lookupNameFromCallLog failed", e);
+        } finally {
+            if (cursor != null) {
+                try { cursor.close(); } catch (Exception ignored) { }
+            }
+        }
+        return null;
+    }
+
+    /**
      * 接听正在响铃的电话。
      *
      * 很多 ROM 上 TelecomManager.acceptRingingCall() 不抛异常但也不生效，
@@ -63,13 +100,30 @@ final class PhoneCallHelper {
             tried.add("通知使用权未开启");
         }
 
+        // 2. 无障碍：华为等 ROM 只有这条路能真正点/划到接听（不需要通话权限）
+        if (CallAccessibilityService.isRunning()) {
+            tried.add("无障碍");
+            for (int attempt = 0; attempt < 3; attempt++) {
+                if (CallAccessibilityService.clickAnswer()
+                        && waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1500)) {
+                    result.onResult(true, "已通过无障碍服务接听");
+                    return true;
+                }
+                sleepQuietly(300);
+            }
+        } else if (CallAccessibilityService.isEnabledInSettings(context)) {
+            tried.add("无障碍未连接");
+        } else {
+            tried.add("无障碍未开启");
+        }
+
         if (!hasPermission(context, Manifest.permission.ANSWER_PHONE_CALLS)) {
             result.onResult(false, "接听没有成功（已尝试: " + join(tried)
-                    + "）。请开启“通知使用权”并授予“接听电话”权限");
+                    + "）。请开启“无障碍服务”并授予“接听电话”权限");
             return false;
         }
 
-        // 2. 系统公开接口
+        // 3. 系统公开接口
         tried.add("系统接口");
         try {
             TelecomManager telecom = (TelecomManager) context.getSystemService(Context.TELECOM_SERVICE);
@@ -77,47 +131,32 @@ final class PhoneCallHelper {
         } catch (Exception e) {
             Log.w(TAG, "acceptRingingCall failed", e);
         }
-        if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 2000)) {
+        if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1500)) {
             result.onResult(true, "已通过系统接口接听");
             return true;
         }
 
-        // 3. 旧版 ITelephony 接口
+        // 4. 旧版 ITelephony 接口
         if (invokeITelephony(context, "answerRingingCall")) {
             tried.add("兼容接口");
-            if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1500)) {
+            if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1200)) {
                 result.onResult(true, "已通过兼容方式接听");
                 return true;
             }
         }
 
-        // 4. 耳机接听键：不少 ROM 会把它当成“接听”。正在放音乐时不发，
+        // 5. 耳机接听键：不少 ROM 会把它当成“接听”。正在放音乐时不发，
         //    否则可能被音乐播放器当成播放/暂停。
         if (sendHeadsetHook(context)) {
             tried.add("耳机键");
-            if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 2500)) {
+            if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1500)) {
                 result.onResult(true, "已通过耳机键接听");
                 return true;
             }
         }
 
-        // 5. 无障碍服务点击系统的接听按钮，来电界面可能晚一点出现，多点几次
-        if (CallAccessibilityService.isRunning()) {
-            tried.add("无障碍点击");
-            for (int attempt = 0; attempt < 3; attempt++) {
-                if (CallAccessibilityService.clickAnswer()
-                        && waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1200)) {
-                    result.onResult(true, "已通过无障碍服务接听");
-                    return true;
-                }
-                sleepQuietly(400);
-            }
-        } else if (CallAccessibilityService.isEnabledInSettings(context)) {
-            tried.add("无障碍未运行");
-        }
-
-        result.onResult(false, "接听没有被系统接受（已尝试: " + join(tried)
-                + "）。请确认已开启“通知使用权”和“无障碍服务”，或在系统设置里允许本应用接听电话");
+        result.onResult(false, "没能接通（已尝试: " + join(tried)
+                + "）。请开启“无障碍服务”，或在系统设置里允许本应用接听电话");
         return false;
     }
 
@@ -154,9 +193,21 @@ final class PhoneCallHelper {
             }
         }
 
+        if (CallAccessibilityService.isRunning()) {
+            tried.add("无障碍");
+            for (int attempt = 0; attempt < 2; attempt++) {
+                if (CallAccessibilityService.clickHangUp()
+                        && waitForState(context, TelephonyManager.CALL_STATE_IDLE, 1200)) {
+                    result.onResult(true, "已通过无障碍服务挂断");
+                    return true;
+                }
+                sleepQuietly(300);
+            }
+        }
+
         if (!hasPermission(context, Manifest.permission.ANSWER_PHONE_CALLS)) {
             result.onResult(false, "挂断没有成功（已尝试: " + join(tried)
-                    + "）。请开启“通知使用权”并授予“接听电话”权限");
+                    + "）。请开启“无障碍服务”并授予“接听电话”权限");
             return false;
         }
 
