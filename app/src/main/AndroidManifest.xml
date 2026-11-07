@@ -50,6 +50,16 @@
                 android:resource="@xml/accessibility_service_config" />
         </service>
 
+        <!-- 可选：成为“来电筛选”应用后，响铃前就能拿到号码（Android 10+） -->
+        <service
+            android:name=".IncomingCallScreeningService"
+            android:exported="true"
+            android:permission="android.permission.BIND_SCREENING_SERVICE">
+            <intent-filter>
+                <action android:name="android.telecom.CallScreeningService" />
+            </intent-filter>
+        </service>
+
         <!-- 可选：没有通话记录权限时，从来电通知里拿号码 -->
         <service
             android:name=".CallNotificationListener"

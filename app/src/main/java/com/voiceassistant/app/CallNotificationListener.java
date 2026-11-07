@@ -1,7 +1,10 @@
 package com.voiceassistant.app;
 
 import android.app.Notification;
+import android.content.ComponentName;
+import android.content.Context;
 import android.os.Build;
+import android.provider.Settings;
 import android.os.Bundle;
 import android.service.notification.NotificationListenerService;
 import android.service.notification.StatusBarNotification;
@@ -41,6 +44,23 @@ public class CallNotificationListener extends NotificationListenerService {
         return pendingName;
     }
 
+    /** 用户是否在“通知使用权”里启用了本应用。 */
+    static boolean isEnabled(Context context) {
+        try {
+            String enabled = Settings.Secure.getString(context.getContentResolver(),
+                    "enabled_notification_listeners");
+            if (TextUtils.isEmpty(enabled)) return false;
+            ComponentName expected = new ComponentName(context, CallNotificationListener.class);
+            for (String item : enabled.split(":")) {
+                ComponentName parsed = ComponentName.unflattenFromString(item);
+                if (parsed != null && parsed.equals(expected)) return true;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "isEnabled failed", e);
+        }
+        return false;
+    }
+
     static void clear() {
         pendingNumber = null;
         pendingName = null;
@@ -63,6 +83,8 @@ public class CallNotificationListener extends NotificationListenerService {
             addText(texts, extras.getCharSequence(Notification.EXTRA_TITLE));
             addText(texts, extras.getCharSequence(Notification.EXTRA_TEXT));
             addText(texts, extras.getCharSequence(Notification.EXTRA_BIG_TEXT));
+            addText(texts, extras.getCharSequence(Notification.EXTRA_SUB_TEXT));
+            addText(texts, extras.getCharSequence(Notification.EXTRA_INFO_TEXT));
             CharSequence[] lines = extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES);
             if (lines != null) {
                 for (CharSequence line : lines) addText(texts, line);

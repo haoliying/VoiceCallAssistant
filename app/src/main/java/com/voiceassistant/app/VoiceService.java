@@ -1,5 +1,6 @@
 package com.voiceassistant.app;
 
+import android.Manifest;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -99,6 +100,8 @@ public class VoiceService extends Service {
     /** 只解压了一半的 onnx 文件不可能这么大（完整的 theresa.onnx 约 117MB），用来判断模型是否完整。 */
     private static final long MIN_MODEL_FILE_SIZE = 100L * 1024 * 1024;
     private static final long HEARTBEAT_INTERVAL_MS = 10000L;
+    /** 响铃期间每隔这么久重复播报一次来电信息。 */
+    private static final long RING_REPEAT_INTERVAL_MS = 6000L;
 
     /** 进程级锁：防止多个初始化线程同时读写模型目录。 */
     private static final Object MODEL_LOCK = new Object();
@@ -132,6 +135,8 @@ public class VoiceService extends Service {
     private PhoneStateListener phoneStateListener;
     private volatile int callState = TelephonyManager.CALL_STATE_IDLE;
     private volatile String callerNumber = "";
+    private volatile String callerName = null;
+    private volatile int ringRound = 0;
     private volatile boolean speaking = false;
     private volatile long lastCommandAt = 0L;
     /** TTS 与识别共用，保证同一时刻只有一句话在播。 */
@@ -1106,54 +1111,138 @@ public class VoiceService extends Service {
 
         if (state == TelephonyManager.CALL_STATE_RINGING) {
             if (previous == TelephonyManager.CALL_STATE_RINGING) return;
-            onIncomingCall(incomingNumber);
+            callerNumber = incomingNumber == null ? "" : incomingNumber.trim();
+            if (callerNumber.isEmpty()) {
+                String screened = IncomingCallScreeningService.recentNumber();
+                if (screened != null) callerNumber = screened;
+            }
+            callerName = null;
+            logCallPermissions();
+            startRingAnnouncements();
         } else if (state == TelephonyManager.CALL_STATE_OFFHOOK) {
             if (previous == TelephonyManager.CALL_STATE_OFFHOOK) return;
+            stopRingAnnouncements();
             broadcastDebug("[来电] 已接通，通话中");
             notifyCallState(CALL_STATE_OFFHOOK, "通话中");
             updateNotification(currentStatus);
         } else {
             if (previous == TelephonyManager.CALL_STATE_IDLE) return;
+            stopRingAnnouncements();
             callerNumber = "";
+            callerName = null;
             CallNotificationListener.clear();
+            IncomingCallScreeningService.clear();
             broadcastDebug("[来电] 通话结束");
             notifyCallState(CALL_STATE_IDLE, "空闲");
             updateNotification(currentStatus);
         }
     }
 
-    /** 来电时查联系人并播报“某某某来电话”。 */
-    private void onIncomingCall(String incomingNumber) {
-        new Thread(() -> {
-            String number = incomingNumber == null ? "" : incomingNumber.trim();
-            if (number.isEmpty()) {
-                // Android 9 以后没有通话记录权限时拿不到号码，退回通知栏去抓
-                String fromNotification = CallNotificationListener.recentNumber();
-                if (fromNotification != null) number = fromNotification;
-            }
+    /** 响铃期间反复播报，直到接通、拒接或对方挂断。 */
+    private final Runnable ringAnnouncer = new Runnable() {
+        @Override
+        public void run() {
+            if (destroyed || callState != TelephonyManager.CALL_STATE_RINGING) return;
+            ringRound++;
+            final int round = ringRound;
+            new Thread(() -> announceRingRound(round)).start();
+            handler.postDelayed(this, RING_REPEAT_INTERVAL_MS);
+        }
+    };
+
+    private void startRingAnnouncements() {
+        handler.removeCallbacks(ringAnnouncer);
+        ringRound = 0;
+        handler.post(ringAnnouncer);
+    }
+
+    private void stopRingAnnouncements() {
+        handler.removeCallbacks(ringAnnouncer);
+    }
+
+    /** 每一轮都重新确认一次号码和姓名，通知栏后补上的信息下一轮就能用上。 */
+    private void announceRingRound(int round) {
+        String number = resolveCallerNumber(round == 1);
+        if (!number.isEmpty() && !number.equals(callerNumber)) {
             callerNumber = number;
-
-            String name = PhoneCallHelper.lookupContactName(VoiceService.this, number);
-            if (name == null) name = CallNotificationListener.recentName();
-
-            String text;
-            if (name != null) {
-                text = name + "来电话";
-            } else if (!number.isEmpty()) {
-                text = "陌生号码来电话";
-            } else {
-                text = "有来电";
+            callerName = PhoneCallHelper.lookupContactName(this, number);
+            if (callerName != null) {
+                broadcastDebug("[来电] 匹配到联系人: " + callerName);
             }
+        }
+        if (callerName == null && callerNumber.isEmpty()) {
+            String hint = CallNotificationListener.recentName();
+            if (hint != null) callerName = hint;
+        }
 
-            broadcastDebug("[来电] 号码 " + (number.isEmpty() ? "未知" : PhoneCallHelper.maskNumber(number))
-                    + "，联系人 " + (name != null ? name : "未知"));
-            notifyCallState(CALL_STATE_RINGING, text);
-            updateNotification(currentStatus);
+        if (destroyed || callState != TelephonyManager.CALL_STATE_RINGING) return;
 
-            if (AppSettings.isAnnounceCaller(VoiceService.this)) {
-                speak(text);
-            }
-        }).start();
+        String text = buildCallerText();
+        broadcastDebug("[来电] 第" + round + "次播报: " + text + "（号码 "
+                + (callerNumber.isEmpty() ? "未知" : PhoneCallHelper.maskNumber(callerNumber)) + "）");
+        notifyCallState(CALL_STATE_RINGING, text);
+        updateNotification(currentStatus);
+
+        if (AppSettings.isAnnounceCaller(this)) {
+            speak(text);
+        }
+    }
+
+    /** 号码优先用系统回调里的；为空时再去通知栏里等一会儿。 */
+    private String resolveCallerNumber(boolean waitForNotification) {
+        if (!callerNumber.isEmpty()) return callerNumber;
+
+        String screened = IncomingCallScreeningService.recentNumber();
+        if (screened != null) return screened;
+
+        String fromNotification = CallNotificationListener.recentNumber();
+        if (fromNotification != null) return fromNotification;
+        if (!waitForNotification || !CallNotificationListener.isEnabled(this)) return "";
+
+        // 来电通知通常比铃声晚一点到，最多等 1.2 秒
+        for (int i = 0; i < 12 && !destroyed
+                && callState == TelephonyManager.CALL_STATE_RINGING; i++) {
+            sleepQuietly(100);
+            fromNotification = CallNotificationListener.recentNumber();
+            if (fromNotification != null) return fromNotification;
+        }
+        return "";
+    }
+
+    /** 联系人读名字，陌生号码逐位读数字。 */
+    private String buildCallerText() {
+        if (callerName != null && !callerName.isEmpty()) {
+            return callerName + "来电话";
+        }
+        if (!callerNumber.isEmpty()) {
+            String spoken = digitsToSpeech(callerNumber);
+            if (!spoken.isEmpty()) return spoken + "来电话";
+        }
+        return "有来电";
+    }
+
+    /** 逐位读号码，避免 TTS 把 13800138000 念成“十三亿多”。 */
+    private static String digitsToSpeech(String number) {
+        String digits = number.replaceAll("[^0-9]", "");
+        if (digits.isEmpty()) return "";
+        if (digits.length() > 15) digits = digits.substring(0, 15);
+        String[] table = {"零", "一", "二", "三", "四", "五", "六", "七", "八", "九"};
+        StringBuilder sb = new StringBuilder(digits.length());
+        for (int i = 0; i < digits.length(); i++) {
+            sb.append(table[digits.charAt(i) - '0']);
+        }
+        return sb.toString();
+    }
+
+    private void logCallPermissions() {
+        broadcastDebug("[来电] 权限 联系人=" + granted(Manifest.permission.READ_CONTACTS)
+                + " 通话记录=" + granted(Manifest.permission.READ_CALL_LOG)
+                + " 来电筛选=" + (IncomingCallScreeningService.isEnabled(this) ? "已开启" : "未开启")
+                + " 通知使用权=" + (CallNotificationListener.isEnabled(this) ? "已开启" : "未开启"));
+    }
+
+    private String granted(String permission) {
+        return PhoneCallHelper.hasPermission(this, permission) ? "已授权" : "未授权";
     }
 
     private void answerIncomingCall() {
@@ -1342,6 +1431,7 @@ public class VoiceService extends Service {
     public void onDestroy() {
         destroyed = true;
         isListening = false;
+        stopRingAnnouncements();
         unregisterPhoneStateListener();
         modelReady = false;
         ttsReady = false;

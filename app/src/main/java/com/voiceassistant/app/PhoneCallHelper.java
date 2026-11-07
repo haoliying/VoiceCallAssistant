@@ -42,13 +42,34 @@ final class PhoneCallHelper {
         if (number == null || number.trim().isEmpty()) return null;
         if (!hasPermission(context, Manifest.permission.READ_CONTACTS)) return null;
 
-        String normalized = number.replaceAll("[^0-9+]", "");
-        if (normalized.isEmpty()) return null;
+        // 同一个号码可能存成 +8613800138000 / 13800138000，逐个候选值试一遍
+        for (String candidate : candidates(number)) {
+            String name = queryName(context, candidate);
+            if (name != null) return name;
+        }
+        return null;
+    }
 
+    private static java.util.List<String> candidates(String number) {
+        java.util.List<String> result = new java.util.ArrayList<>();
+        String digits = number.replaceAll("[^0-9]", "");
+        if (digits.isEmpty()) return result;
+        result.add(digits);
+
+        if (digits.length() > 11) {
+            result.add(digits.substring(digits.length() - 11));
+        }
+        if (digits.startsWith("86") && digits.length() == 13) {
+            result.add(digits.substring(2));
+        }
+        return result;
+    }
+
+    private static String queryName(Context context, String number) {
         android.database.Cursor cursor = null;
         try {
             Uri uri = Uri.withAppendedPath(
-                    ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(normalized));
+                    ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(number));
             cursor = context.getContentResolver().query(uri,
                     new String[]{ContactsContract.PhoneLookup.DISPLAY_NAME}, null, null, null);
             if (cursor != null && cursor.moveToFirst()) {
@@ -56,7 +77,7 @@ final class PhoneCallHelper {
                 if (name != null && !name.trim().isEmpty()) return name.trim();
             }
         } catch (Exception e) {
-            Log.w(TAG, "lookupContactName failed", e);
+            Log.w(TAG, "queryName failed", e);
         } finally {
             if (cursor != null) {
                 try { cursor.close(); } catch (Exception ignored) { }

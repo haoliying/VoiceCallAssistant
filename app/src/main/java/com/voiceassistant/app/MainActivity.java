@@ -7,6 +7,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
+import android.app.role.RoleManager;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -34,6 +35,7 @@ import java.util.Locale;
 public class MainActivity extends AppCompatActivity {
 
     private static final int PERMISSION_REQUEST_CODE = 100;
+    private static final int CALL_SCREENING_ROLE_REQUEST = 101;
     private static final int MAX_DEBUG_LINES = 60;
 
     private Button btnStartStop;
@@ -158,6 +160,13 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        findViewById(R.id.btnCallScreening).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                requestCallScreeningRole();
+            }
+        });
+
         findViewById(R.id.btnNotificationAccess).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -277,6 +286,8 @@ public class MainActivity extends AppCompatActivity {
         sb.append("  通话记录：").append(stateOf(Manifest.permission.READ_CALL_LOG));
         sb.append("\n接听电话：").append(stateOf(Manifest.permission.ANSWER_PHONE_CALLS));
         sb.append("  拨打电话：").append(stateOf(Manifest.permission.CALL_PHONE));
+        sb.append("\n来电筛选：").append(IncomingCallScreeningService.isEnabled(this) ? "已开启" : "未开启");
+        sb.append("  通知使用权：").append(CallNotificationListener.isEnabled(this) ? "已开启" : "未开启");
         sb.append("\n无障碍服务：").append(CallAccessibilityService.isEnabledInSettings(this) ? "已开启" : "未开启");
         tvPermissions.setText(sb.toString());
     }
@@ -292,6 +303,40 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "在列表里找到“语音助手挂断辅助”并开启", Toast.LENGTH_LONG).show();
         } catch (Exception e) {
             appendDebug("无法打开无障碍设置: " + e.getMessage());
+        }
+    }
+
+    /** 申请“来电筛选”角色：Android 10+ 响铃前就能拿到号码。 */
+    private void requestCallScreeningRole() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            Toast.makeText(this, "Android 10 以下不需要该角色", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            RoleManager roleManager = (RoleManager) getSystemService(Context.ROLE_SERVICE);
+            if (roleManager == null || !roleManager.isRoleAvailable(RoleManager.ROLE_CALL_SCREENING)) {
+                Toast.makeText(this, "本机不支持来电筛选角色，请改用通知使用权", Toast.LENGTH_LONG).show();
+                return;
+            }
+            if (roleManager.isRoleHeld(RoleManager.ROLE_CALL_SCREENING)) {
+                Toast.makeText(this, "来电筛选已开启", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            startActivityForResult(
+                    roleManager.createRequestRoleIntent(RoleManager.ROLE_CALL_SCREENING),
+                    CALL_SCREENING_ROLE_REQUEST);
+        } catch (Exception e) {
+            appendDebug("申请来电筛选角色失败: " + e.getMessage());
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == CALL_SCREENING_ROLE_REQUEST) {
+            updatePermissionSummary();
+            Toast.makeText(this, resultCode == RESULT_OK ? "来电筛选已开启" : "未开启来电筛选",
+                    Toast.LENGTH_SHORT).show();
         }
     }
 
