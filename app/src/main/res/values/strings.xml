@@ -1,5 +1,5 @@
 <resources>
     <string name="app_name">语音电话助手</string>
-    <string name="accessibility_label">语音助手挂断辅助</string>
-    <string name="accessibility_description">仅在收到挂断语音指令时，用于点击通话界面上的挂断按钮。不读取任何其它内容。</string>
+    <string name="accessibility_label">语音助手来电辅助</string>
+    <string name="accessibility_description">仅用于来电时查找并点击“接听/挂断”按钮；点不到时按位置点按或上滑接听。只在通话界面生效，不读取聊天、输入框等其它内容。</string>
 </resources>

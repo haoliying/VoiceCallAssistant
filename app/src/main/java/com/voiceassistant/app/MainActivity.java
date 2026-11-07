@@ -325,8 +325,8 @@ public class MainActivity extends AppCompatActivity {
                 new AlertDialog.Builder(this)
                         .setTitle("还差一步：无障碍服务")
                         .setMessage("系统不允许第三方应用直接接听/挂断电话，必须在无障碍设置里打开"
-                                + "“语音助手挂断辅助”，应用才能替你点接听、划接听。\n\n"
-                                + "路径：无障碍 → 已下载的应用 → 语音助手挂断辅助 → 开启")
+                                + "“语音助手来电辅助”，应用才能替你点接听、划接听。\n\n"
+                                + "路径：无障碍 → 已下载的应用 → 语音助手来电辅助 → 开启")
                         .setPositiveButton("去开启", (dialog, which) -> openAccessibilitySettings())
                         .setNegativeButton("稍后", null)
                         .show();
@@ -352,7 +352,7 @@ public class MainActivity extends AppCompatActivity {
     private void openAccessibilitySettings() {
         try {
             startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
-            Toast.makeText(this, "在列表里找到“语音助手挂断辅助”并开启", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "在列表里找到“语音助手来电辅助”并开启", Toast.LENGTH_LONG).show();
         } catch (Exception e) {
             appendDebug("无法打开无障碍设置: " + e.getMessage());
         }
