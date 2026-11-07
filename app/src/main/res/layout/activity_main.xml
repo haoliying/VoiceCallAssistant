@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp"
+    android:background="#FFFFFF">
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="语音电话助手"
+                android:textSize="22sp"
+                android:textColor="#222222"
+                android:textStyle="bold"
+                android:layout_gravity="center_horizontal"
+                android:layout_marginBottom="12dp" />
+
+            <Button
+                android:id="@+id/btnStartStop"
+                android:layout_width="200dp"
+                android:layout_height="48dp"
+                android:text="启动服务"
+                android:textSize="16sp"
+                android:layout_gravity="center_horizontal"
+                android:layout_marginBottom="8dp" />
+
+            <TextView
+                android:id="@+id/tvStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="服务状态：已停止"
+                android:textSize="14sp"
+                android:textColor="#666666"
+                android:layout_marginBottom="4dp" />
+
+            <TextView
+                android:id="@+id/tvCall"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="通话状态：空闲"
+                android:textSize="14sp"
+                android:textColor="#666666"
+                android:layout_marginBottom="16dp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="权限"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:textColor="#222222"
+                android:layout_marginBottom="6dp" />
+
+            <TextView
+                android:id="@+id/tvPermissions"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="正在检查权限..."
+                android:textSize="13sp"
+                android:textColor="#444444"
+                android:layout_marginBottom="8dp" />
+
+            <Button
+                android:id="@+id/btnPermissions"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="授予/检查权限"
+                android:layout_marginBottom="8dp" />
+
+            <Button
+                android:id="@+id/btnAccessibility"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="开启无障碍服务（语音挂断兜底）"
+                android:layout_marginBottom="8dp" />
+
+            <Button
+                android:id="@+id/btnNotificationAccess"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="开启通知使用权（号码兜底）"
+                android:layout_marginBottom="16dp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="语音指令配置"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:textColor="#222222"
+                android:layout_marginBottom="6dp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="问时间口令"
+                android:textSize="13sp"
+                android:textColor="#666666" />
+
+            <EditText
+                android:id="@+id/etTimeCommand"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="text"
+                android:maxLines="1"
+                android:hint="几点了"
+                android:layout_marginBottom="8dp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="接听口令"
+                android:textSize="13sp"
+                android:textColor="#666666" />
+
+            <EditText
+                android:id="@+id/etAnswerCommand"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="text"
+                android:maxLines="1"
+                android:hint="接电话"
+                android:layout_marginBottom="8dp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="挂断口令"
+                android:textSize="13sp"
+                android:textColor="#666666" />
+
+            <EditText
+                android:id="@+id/etHangupCommand"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="text"
+                android:maxLines="1"
+                android:hint="挂断电话"
+                android:layout_marginBottom="8dp" />
+
+            <CheckBox
+                android:id="@+id/cbAnnounceCaller"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="来电时播报联系人姓名"
+                android:checked="true"
+                android:layout_marginBottom="8dp" />
+
+            <Button
+                android:id="@+id/btnSaveSettings"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="保存指令"
+                android:layout_marginBottom="6dp" />
+
+            <TextView
+                android:id="@+id/tvSettingsHint"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="默认：几点了 / 接电话 / 挂断电话，改成别的说法后立即生效。"
+                android:textSize="12sp"
+                android:textColor="#888888"
+                android:layout_marginBottom="12dp" />
+        </LinearLayout>
+    </ScrollView>
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="实时识别结果："
+        android:textSize="14sp"
+        android:textColor="#333333"
+        android:textStyle="bold"
+        android:layout_marginBottom="4dp" />
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="180dp"
+        android:background="#F5F5F5"
+        android:padding="8dp">
+
+        <TextView
+            android:id="@+id/tvDebug"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="等待服务启动..."
+            android:textSize="13sp"
+            android:textColor="#444444"
+            android:fontFamily="monospace"
+            android:lineSpacingExtra="2dp" />
+    </ScrollView>
+
+</LinearLayout>

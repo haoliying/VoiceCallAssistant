@@ -1,0 +1,421 @@
+package com.voiceassistant.app;
+
+import android.Manifest;
+import android.content.BroadcastReceiver;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.ServiceConnection;
+import android.content.pm.PackageManager;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.IBinder;
+import android.provider.Settings;
+import android.text.TextUtils;
+import android.view.View;
+import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.EditText;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+import androidx.localbroadcastmanager.content.LocalBroadcastManager;
+
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Locale;
+
+public class MainActivity extends AppCompatActivity {
+
+    private static final int PERMISSION_REQUEST_CODE = 100;
+    private static final int MAX_DEBUG_LINES = 60;
+
+    private Button btnStartStop;
+    private Button btnSaveSettings;
+    private Button btnPermissions;
+    private TextView tvStatus;
+    private TextView tvCall;
+    private TextView tvPermissions;
+    private TextView tvSettingsHint;
+    private TextView tvDebug;
+    private EditText etTime;
+    private EditText etAnswer;
+    private EditText etHangup;
+    private CheckBox cbAnnounce;
+
+    private boolean serviceRunning = false;
+    private boolean bound = false;
+    private final StringBuilder debugLog = new StringBuilder();
+    private final SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm:ss", Locale.getDefault());
+
+    private final ServiceConnection serviceConnection = new ServiceConnection() {
+        @Override
+        public void onServiceConnected(ComponentName name, IBinder binder) {
+            serviceRunning = true;
+            refreshStatusText();
+            LocalBroadcastManager.getInstance(MainActivity.this)
+                    .sendBroadcast(new Intent(VoiceService.ACTION_REQUEST_STATUS));
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            serviceRunning = false;
+            applyStatus(VoiceService.STATUS_STOPPED, "", "");
+        }
+    };
+
+    private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            // 能收到服务的广播，说明服务一定还活着
+            serviceRunning = true;
+            applyStatus(intent.getStringExtra(VoiceService.EXTRA_STATUS),
+                    intent.getStringExtra(VoiceService.EXTRA_ERROR),
+                    intent.getStringExtra(VoiceService.EXTRA_DETAIL));
+        }
+    };
+
+    private final BroadcastReceiver debugReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String message = intent.getStringExtra(VoiceService.EXTRA_DEBUG);
+            if (message != null) {
+                appendDebug(message);
+            }
+        }
+    };
+
+    private final BroadcastReceiver callReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String state = intent.getStringExtra(VoiceService.EXTRA_CALL_STATE);
+            String text = intent.getStringExtra(VoiceService.EXTRA_CALL_TEXT);
+            if (VoiceService.CALL_STATE_IDLE.equals(state)) {
+                tvCall.setText("通话状态：空闲");
+            } else if (VoiceService.CALL_STATE_RINGING.equals(state)) {
+                tvCall.setText("来电播报：" + (text != null ? text : "有来电"));
+            } else {
+                tvCall.setText("通话状态：通话中");
+            }
+        }
+    };
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        btnStartStop = findViewById(R.id.btnStartStop);
+        btnSaveSettings = findViewById(R.id.btnSaveSettings);
+        btnPermissions = findViewById(R.id.btnPermissions);
+        tvStatus = findViewById(R.id.tvStatus);
+        tvCall = findViewById(R.id.tvCall);
+        tvPermissions = findViewById(R.id.tvPermissions);
+        tvSettingsHint = findViewById(R.id.tvSettingsHint);
+        tvDebug = findViewById(R.id.tvDebug);
+        etTime = findViewById(R.id.etTimeCommand);
+        etAnswer = findViewById(R.id.etAnswerCommand);
+        etHangup = findViewById(R.id.etHangupCommand);
+        cbAnnounce = findViewById(R.id.cbAnnounceCaller);
+
+        loadSettingsIntoViews();
+
+        btnStartStop.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (!serviceRunning) {
+                    startVoiceService();
+                } else {
+                    stopVoiceService();
+                }
+            }
+        });
+
+        btnSaveSettings.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                saveSettings();
+            }
+        });
+
+        btnPermissions.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                requestAllPermissions();
+            }
+        });
+
+        findViewById(R.id.btnAccessibility).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openAccessibilitySettings();
+            }
+        });
+
+        findViewById(R.id.btnNotificationAccess).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openNotificationListenerSettings();
+            }
+        });
+
+        requestAllPermissions();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        LocalBroadcastManager manager = LocalBroadcastManager.getInstance(this);
+        manager.registerReceiver(statusReceiver, new IntentFilter(VoiceService.ACTION_STATUS));
+        manager.registerReceiver(debugReceiver, new IntentFilter(VoiceService.ACTION_DEBUG));
+        manager.registerReceiver(callReceiver, new IntentFilter(VoiceService.ACTION_CALL));
+        refreshServiceState();
+        updatePermissionSummary();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        LocalBroadcastManager manager = LocalBroadcastManager.getInstance(this);
+        manager.unregisterReceiver(statusReceiver);
+        manager.unregisterReceiver(debugReceiver);
+        manager.unregisterReceiver(callReceiver);
+        if (bound) {
+            try {
+                unbindService(serviceConnection);
+            } catch (Exception ignored) {
+                // 已经解绑
+            }
+            bound = false;
+        }
+    }
+
+    // ========== 配置 ==========
+
+    private void loadSettingsIntoViews() {
+        etTime.setText(AppSettings.getTimeQuery(this));
+        etAnswer.setText(AppSettings.getAnswer(this));
+        etHangup.setText(AppSettings.getHangup(this));
+        cbAnnounce.setChecked(AppSettings.isAnnounceCaller(this));
+        tvSettingsHint.setText("默认：几点了 / 接电话 / 挂断电话，改成别的说法后立即生效。");
+    }
+
+    private void saveSettings() {
+        String time = etTime.getText().toString().trim();
+        String answer = etAnswer.getText().toString().trim();
+        String hangup = etHangup.getText().toString().trim();
+
+        if (TextUtils.isEmpty(time) || TextUtils.isEmpty(answer) || TextUtils.isEmpty(hangup)) {
+            Toast.makeText(this, "三个口令都不能为空", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (time.equals(answer) || time.equals(hangup) || answer.equals(hangup)) {
+            Toast.makeText(this, "口令不能重复，否则无法区分动作", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        AppSettings.save(this, time, answer, hangup, cbAnnounce.isChecked());
+        etTime.setText(AppSettings.getTimeQuery(this));
+        etAnswer.setText(AppSettings.getAnswer(this));
+        etHangup.setText(AppSettings.getHangup(this));
+        tvSettingsHint.setText("已保存：" + time + " / " + answer + " / " + hangup + "（服务无需重启）");
+        Toast.makeText(this, "指令已保存", Toast.LENGTH_SHORT).show();
+        appendDebug("配置已更新: " + time + " / " + answer + " / " + hangup);
+    }
+
+    // ========== 权限 ==========
+
+    private String[] requiredPermissions() {
+        List<String> permissions = new ArrayList<>();
+        permissions.add(Manifest.permission.RECORD_AUDIO);
+        permissions.add(Manifest.permission.READ_PHONE_STATE);
+        permissions.add(Manifest.permission.READ_CONTACTS);
+        permissions.add(Manifest.permission.READ_CALL_LOG);
+        permissions.add(Manifest.permission.ANSWER_PHONE_CALLS);
+        permissions.add(Manifest.permission.CALL_PHONE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS);
+        }
+        return permissions.toArray(new String[0]);
+    }
+
+    private void requestAllPermissions() {
+        List<String> missing = new ArrayList<>();
+        for (String permission : requiredPermissions()) {
+            if (ContextCompat.checkSelfPermission(this, permission)
+                    != PackageManager.PERMISSION_GRANTED) {
+                missing.add(permission);
+            }
+        }
+        if (missing.isEmpty()) {
+            updatePermissionSummary();
+            return;
+        }
+        ActivityCompat.requestPermissions(this,
+                missing.toArray(new String[0]), PERMISSION_REQUEST_CODE);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == PERMISSION_REQUEST_CODE) {
+            updatePermissionSummary();
+        }
+    }
+
+    private void updatePermissionSummary() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("录音：").append(stateOf(Manifest.permission.RECORD_AUDIO));
+        sb.append("  电话状态：").append(stateOf(Manifest.permission.READ_PHONE_STATE));
+        sb.append("\n联系人：").append(stateOf(Manifest.permission.READ_CONTACTS));
+        sb.append("  通话记录：").append(stateOf(Manifest.permission.READ_CALL_LOG));
+        sb.append("\n接听电话：").append(stateOf(Manifest.permission.ANSWER_PHONE_CALLS));
+        sb.append("  拨打电话：").append(stateOf(Manifest.permission.CALL_PHONE));
+        sb.append("\n无障碍服务：").append(CallAccessibilityService.isEnabledInSettings(this) ? "已开启" : "未开启");
+        tvPermissions.setText(sb.toString());
+    }
+
+    private String stateOf(String permission) {
+        return ContextCompat.checkSelfPermission(this, permission)
+                == PackageManager.PERMISSION_GRANTED ? "已授权" : "未授权";
+    }
+
+    private void openAccessibilitySettings() {
+        try {
+            startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+            Toast.makeText(this, "在列表里找到“语音助手挂断辅助”并开启", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            appendDebug("无法打开无障碍设置: " + e.getMessage());
+        }
+    }
+
+    private void openNotificationListenerSettings() {
+        try {
+            startActivity(new Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"));
+            Toast.makeText(this, "找到“语音助手”并允许读取通知", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            try {
+                startActivity(new Intent(Settings.ACTION_SETTINGS));
+            } catch (Exception ignored) {
+                appendDebug("无法打开通知使用权设置: " + e.getMessage());
+            }
+        }
+    }
+
+    // ========== 服务 ==========
+
+    private void refreshServiceState() {
+        boolean alive;
+        try {
+            alive = bindService(new Intent(this, VoiceService.class), serviceConnection, 0);
+        } catch (Exception e) {
+            alive = false;
+        }
+
+        if (alive) {
+            bound = true;
+            serviceRunning = true;
+            refreshStatusText();
+            LocalBroadcastManager.getInstance(this)
+                    .sendBroadcast(new Intent(VoiceService.ACTION_REQUEST_STATUS));
+        } else {
+            bound = false;
+            serviceRunning = false;
+            applyStatus(VoiceService.STATUS_STOPPED, "", "");
+        }
+    }
+
+    /** 先用服务保存的状态占位，随后会收到服务的实时状态。 */
+    private void refreshStatusText() {
+        ServiceState.Snapshot snapshot = ServiceState.load(this);
+        if (snapshot.isFresh()) {
+            applyStatus(snapshot.status, snapshot.error, snapshot.detail);
+        } else {
+            applyStatus(VoiceService.STATUS_LOADING, "", "正在连接服务...");
+        }
+    }
+
+    private void startVoiceService() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            appendDebug("请先授予录音权限，再启动服务");
+            requestAllPermissions();
+            return;
+        }
+
+        debugLog.setLength(0);
+        tvDebug.setText("");
+
+        try {
+            Intent intent = new Intent(this, VoiceService.class);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent);
+            } else {
+                startService(intent);
+            }
+            serviceRunning = true;
+            applyStatus(VoiceService.STATUS_LOADING, "", "服务启动中...");
+            appendDebug("服务启动中...");
+        } catch (Exception e) {
+            serviceRunning = false;
+            applyStatus(VoiceService.STATUS_ERROR,
+                    e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName(), "");
+            appendDebug("启动失败: " + e.getMessage());
+        }
+    }
+
+    private void stopVoiceService() {
+        try {
+            stopService(new Intent(this, VoiceService.class));
+        } catch (Exception e) {
+            appendDebug("停止服务失败: " + e.getMessage());
+        }
+        serviceRunning = false;
+        ServiceState.save(this, false, VoiceService.STATUS_STOPPED, "", "");
+        applyStatus(VoiceService.STATUS_STOPPED, "", "");
+        tvCall.setText("通话状态：空闲");
+        appendDebug("服务已停止");
+    }
+
+    private void applyStatus(String status, String error, String detail) {
+        String text;
+        if (VoiceService.STATUS_LOADING.equals(status)) {
+            text = "服务状态：" + (detail != null && !detail.isEmpty() ? detail : "正在加载模型...");
+        } else if (VoiceService.STATUS_READY.equals(status)
+                || VoiceService.STATUS_LISTENING.equals(status)) {
+            text = "服务状态：监听中，可说“" + AppSettings.getTimeQuery(this)
+                    + "”查时间，来电时说“" + AppSettings.getAnswer(this) + "”";
+        } else if (VoiceService.STATUS_ERROR.equals(status)) {
+            text = "服务状态：出错 - " + (error != null ? error : "");
+        } else {
+            text = "服务状态：已停止";
+        }
+
+        tvStatus.setText(text);
+        btnStartStop.setText(serviceRunning ? "停止服务" : "启动服务");
+    }
+
+    private void appendDebug(String message) {
+        String time = timeFormat.format(new Date());
+        String line = "[" + time + "] " + message + "\n";
+        debugLog.append(line);
+
+        // 只保留最近若干行，避免长时间运行占用内存
+        String[] lines = debugLog.toString().split("\n");
+        if (lines.length > MAX_DEBUG_LINES) {
+            debugLog.setLength(0);
+            int start = lines.length - MAX_DEBUG_LINES;
+            for (int i = start; i < lines.length; i++) {
+                debugLog.append(lines[i]).append("\n");
+            }
+        }
+
+        tvDebug.setText(debugLog.toString());
+    }
+}

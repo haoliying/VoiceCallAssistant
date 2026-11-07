@@ -1,0 +1,44 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.voiceassistant.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.voiceassistant.app"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+
+        // sherpa-onnx 只提供了 arm64-v8a 的库，其它架构的 Vosk 库没有用，去掉可以减小安装包
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'androidx.localbroadcastmanager:localbroadcastmanager:1.1.0'
+    implementation 'com.alphacephei:vosk-android:0.3.47'
+    implementation 'net.java.dev.jna:jna:5.13.0@aar'
+    implementation 'org.apache.commons:commons-compress:1.26.0'
+    implementation 'org.tukaani:xz:1.9'
+}

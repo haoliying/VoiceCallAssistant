@@ -1,0 +1,47 @@
+# 语音电话助手 (VoiceCallAssistant)
+
+在 [VoiceClock](https://github.com/haoliying/VoiceClock) 的基础上扩展的语音控制版本：离线语音识别 + 离线语音合成，全部在本机完成，不联网（仅在首次启动时下载一次 TTS 模型）。
+
+## 功能
+
+1. **语音问时间**：说“几点了”，播报当前时间。
+2. **来电报姓名**：来电时查询联系人，播报“张三来电话”；陌生号码播报“陌生号码来电话”。
+3. **语音接听**：响铃时说“接电话”，自动接听。
+4. **语音挂断**：响铃或通话中说“挂断电话”，自动挂断。
+5. **口令可配置**：三个口令都可以在界面里改，保存后立即生效，不需要重启服务。
+
+## 首次使用
+
+1. 安装 APK，打开应用，按提示授予权限（录音、电话状态、联系人、通话记录、接听电话等）。
+2. 点“启动服务”，首次启动会下载约 116MB 的语音合成模型并解压，之后不再下载。
+3. 建议再开启两个可选项：
+   - **无障碍服务**：系统没有公开的“挂断电话”接口，开启后可通过点击通话界面的挂断按钮兜底。
+   - **通知使用权**：Android 9 以后若没给通话记录权限，来电号码会是空的，开启后相当一部分机型可以从来电通知里取到号码/姓名。
+4. 手机设置里把本应用加入电池优化白名单，避免后台被杀。
+
+## 已知限制
+
+- **通话中录音**：Android 10 以后第三方应用无法录制通话音频，接通后麦克风可能只返回静音。因此“挂断电话”在**响铃阶段**（拒接）最可靠，通话过程中能否识别取决于机型和 ROM。
+- **挂断接口**：`TelecomManager.endCall()` 在部分 ROM 上只对默认拨号应用开放。本应用会依次尝试 `TelecomManager.endCall` → `ITelephony.endCall`（反射）→ 无障碍点击，日志里会显示实际生效的方式。
+- TTS 只支持 arm64-v8a 真机，模拟器一般跑不起来。
+
+## 构建
+
+```bash
+# 需要 Android SDK 34 + JDK 17/21
+echo "sdk.dir=/path/to/android-sdk" > local.properties
+./gradlew assembleDebug
+```
+
+产物：`app/build/outputs/apk/debug/app-debug.apk`
+
+## 结构
+
+| 文件 | 作用 |
+| --- | --- |
+| `VoiceService.java` | 前台服务：模型下载/解压、Vosk 识别、TTS 播报、来电监听 |
+| `VoiceCommands.java` | 口令匹配（配置优先 + 同义词 + 容错） |
+| `AppSettings.java` | 口令配置持久化 |
+| `PhoneCallHelper.java` | 联系人查询、接听、挂断（多级兜底） |
+| `CallAccessibilityService.java` | 可选的挂断兜底（无障碍点击） |
+| `CallNotificationListener.java` | 可选的来电号码兜底（读取通话通知） |
