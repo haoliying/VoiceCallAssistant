@@ -108,9 +108,10 @@ final class ContactsIndex {
         return sb.toString();
     }
 
+    /** 只读当前状态，不在主线程触发全量加载。 */
     static String describe(Context context) {
-        Snapshot data = ensureLoaded(context);
-        if (data == null) return "通讯录索引不可用";
+        Snapshot data = snapshot;
+        if (data == null) return "通讯录索引: 正在加载";
         String text = "通讯录索引: " + data.numbers + " 个号码/" + data.contacts + " 位联系人";
         if (data.error != null) text += "（异常: " + data.error + "）";
         return text;
