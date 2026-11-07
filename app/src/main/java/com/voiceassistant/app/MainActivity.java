@@ -44,6 +44,7 @@ public class MainActivity extends AppCompatActivity {
     private TextView tvStatus;
     private TextView tvCall;
     private TextView tvPermissions;
+    private TextView tvLastNotif;
     private TextView tvSettingsHint;
     private TextView tvDebug;
     private EditText etTime;
@@ -52,6 +53,8 @@ public class MainActivity extends AppCompatActivity {
     private CheckBox cbAnnounce;
 
     private boolean serviceRunning = false;
+    /** 本次打开应用已经引导过的权限页，避免用户返回后又被弹走。 */
+    private final java.util.Set<String> guidedSteps = new java.util.HashSet<>();
     private final StringBuilder debugLog = new StringBuilder();
     private final SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm:ss", Locale.getDefault());
 
@@ -103,6 +106,7 @@ public class MainActivity extends AppCompatActivity {
         tvStatus = findViewById(R.id.tvStatus);
         tvCall = findViewById(R.id.tvCall);
         tvPermissions = findViewById(R.id.tvPermissions);
+        tvLastNotif = findViewById(R.id.tvLastNotif);
         tvSettingsHint = findViewById(R.id.tvSettingsHint);
         tvDebug = findViewById(R.id.tvDebug);
         etTime = findViewById(R.id.etTimeCommand);
@@ -133,7 +137,10 @@ public class MainActivity extends AppCompatActivity {
         btnPermissions.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
+                // 重新走一遍引导：运行时权限 -> 通知使用权 -> 无障碍
+                guidedSteps.clear();
                 requestAllPermissions();
+                guideMissingAccess();
             }
         });
 
@@ -175,13 +182,6 @@ public class MainActivity extends AppCompatActivity {
         });
 
         requestAllPermissions();
-
-        // 来电姓名和接听都依赖通知使用权，没有就直接把用户带到授权页
-        if (savedInstanceState == null && !CallNotificationListener.isEnabled(this)) {
-            Toast.makeText(this, "请勾选“语音电话助手”，否则拿不到来电姓名、也无法接听",
-                    Toast.LENGTH_LONG).show();
-            openNotificationListenerSettings();
-        }
     }
 
     @Override
@@ -194,6 +194,8 @@ public class MainActivity extends AppCompatActivity {
         refreshLogFromStore();
         refreshServiceState();
         updatePermissionSummary();
+        updateLastNotification();
+        guideMissingAccess();
     }
 
     @Override
@@ -274,23 +276,65 @@ public class MainActivity extends AppCompatActivity {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == PERMISSION_REQUEST_CODE) {
             updatePermissionSummary();
+            guideMissingAccess();
         }
     }
 
     private void updatePermissionSummary() {
+        boolean notif = CallNotificationListener.isEnabled(this);
+        boolean a11y = CallAccessibilityService.isEnabledInSettings(this);
         StringBuilder sb = new StringBuilder();
-        sb.append("录音：").append(stateOf(Manifest.permission.RECORD_AUDIO));
+        sb.append("必开：\n");
+        sb.append("  录音：").append(stateOf(Manifest.permission.RECORD_AUDIO));
         sb.append("  电话状态：").append(stateOf(Manifest.permission.READ_PHONE_STATE));
-        sb.append("\n通话记录：").append(stateOf(Manifest.permission.READ_CALL_LOG));
         sb.append("  接听电话：").append(stateOf(Manifest.permission.ANSWER_PHONE_CALLS));
-        sb.append("\n拨打电话：").append(stateOf(Manifest.permission.CALL_PHONE));
-        sb.append("\n来电筛选：").append(IncomingCallScreeningService.isEnabled(this) ? "已开启" : "未开启");
-        sb.append("  通知使用权：").append(CallNotificationListener.isEnabled(this) ? "已开启" : "未开启");
-        sb.append("\n无障碍服务：").append(CallAccessibilityService.isEnabledInSettings(this) ? "已开启" : "未开启");
-        if (!CallNotificationListener.isEnabled(this)) {
-            sb.append("\n提示：姓名和接听都靠“通知使用权”，请点下面的按钮开启");
-        }
+        sb.append("\n  通知使用权：").append(notif ? "已开启（来电姓名和接听都用它）" : "未开启（姓名和接听都要它）");
+        sb.append("\n建议开启：\n");
+        sb.append("  通话记录：").append(stateOf(Manifest.permission.READ_CALL_LOG));
+        sb.append("  拨打电话：").append(stateOf(Manifest.permission.CALL_PHONE));
+        sb.append("\n  无障碍服务：").append(a11y ? "已开启（接听/挂断更可靠）" : "未开启（接听/挂断的兜底）");
+        sb.append("  来电筛选：").append(IncomingCallScreeningService.isEnabled(this) ? "已开启" : "未开启");
         tvPermissions.setText(sb.toString());
+    }
+
+    /**
+     * 权限引导：运行时权限 -> 通知使用权 -> 无障碍服务。
+     * 打开应用时缺什么就跳对应授权页；每一步每次启动只跳一次，避免死循环。
+     */
+    private void guideMissingAccess() {
+        List<String> missing = new ArrayList<>();
+        for (String permission : requiredPermissions()) {
+            if (ContextCompat.checkSelfPermission(this, permission)
+                    != PackageManager.PERMISSION_GRANTED) {
+                missing.add(permission);
+            }
+        }
+        if (!missing.isEmpty()) return;
+
+        if (!CallNotificationListener.isEnabled(this)) {
+            if (guidedSteps.add("notification")) {
+                toastLong("第 1 步：在列表里找到“语音电话助手”，开启通知使用权（来电姓名和接听都要它）");
+                openNotificationListenerSettings();
+            }
+            return;
+        }
+
+        if (!CallAccessibilityService.isEnabledInSettings(this)) {
+            if (guidedSteps.add("accessibility")) {
+                toastLong("第 2 步：找到“语音助手挂断辅助”并开启，接听和挂断更可靠");
+                openAccessibilitySettings();
+            }
+        }
+    }
+
+    private void toastLong(String message) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+    }
+
+    /** 显示最近一条来电通知的原文，方便确认“到底读到了什么”。 */
+    private void updateLastNotification() {
+        String raw = CallNotificationListener.lastRaw();
+        tvLastNotif.setText("最近来电通知：" + (raw == null || raw.isEmpty() ? "暂无" : raw));
     }
 
     private String stateOf(String permission) {
@@ -331,6 +375,7 @@ public class MainActivity extends AppCompatActivity {
         sb.append("来电筛选=").append(IncomingCallScreeningService.isEnabled(this) ? "已开启" : "未开启");
         sb.append(" 通知使用权=").append(CallNotificationListener.isEnabled(this) ? "已开启" : "未开启");
         sb.append(" 无障碍=").append(CallAccessibilityService.isEnabledInSettings(this) ? "已开启" : "未开启");
+        sb.append("\n最近来电通知=").append(CallNotificationListener.lastRaw());
         sb.append("\n--- 日志 ---\n");
         // 用服务侧的共享缓冲：界面没打开时的来电日志也在里面
         sb.append(LogStore.dump());

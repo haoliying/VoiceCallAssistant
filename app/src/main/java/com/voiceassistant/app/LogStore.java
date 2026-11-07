@@ -21,7 +21,10 @@ final class LogStore {
 
     static void append(String message) {
         if (message == null) return;
-        String line = "[" + TIME.format(new Date()) + "] " + message;
+        String line;
+        synchronized (TIME) {
+            line = "[" + TIME.format(new Date()) + "] " + message;
+        }
         synchronized (LINES) {
             LINES.addLast(line);
             while (LINES.size() > MAX_LINES) {

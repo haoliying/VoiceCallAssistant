@@ -100,18 +100,14 @@ public class VoiceService extends Service {
     /** 只解压了一半的 onnx 文件不可能这么大（完整的 theresa.onnx 约 117MB），用来判断模型是否完整。 */
     private static final long MIN_MODEL_FILE_SIZE = 100L * 1024 * 1024;
     private static final long HEARTBEAT_INTERVAL_MS = 10000L;
-    /** 数字的语速（>1 更快）。1.15 倍长度≈0.87 语速，接近正常念号码的节奏。 */
-    private static final float DIGIT_SPEED = 0.87f;
-    /** 数字之间的停顿（毫秒）。 */
-    private static final int DIGIT_GAP_MS = 130;
-    /** 手机号按 3-4-4 分组，组间多留一点空档。 */
-    private static final int DIGIT_GROUP_GAP_MS = 280;
+    /** 号码播报语速（<1 更慢）。0.92 ≈ 比正常稍慢一点，念号码更清楚。 */
+    private static final float DIGIT_SPEED = 0.92f;
     /** 一轮播报结束到下一轮开始之间的静默间隔，留给用户下指令。 */
     private static final long RING_GAP_MS = 1200L;
     /** 兜底上限，防止状态判断失灵时无限播报。 */
     private static final int MAX_RING_ROUNDS = 30;
-    /** 等整句号码合成的上限，超时就退回数字拼接。 */
-    private static final long NUMBER_WAIT_MS = 6000L;
+    /** 等整句号码合成的上限，超时就现场合成一次（不再拼接单字）。 */
+    private static final long NUMBER_WAIT_MS = 3500L;
 
     /** 进程级锁：防止多个初始化线程同时读写模型目录。 */
     private static final Object MODEL_LOCK = new Object();
@@ -180,15 +176,8 @@ public class VoiceService extends Service {
     private final Object ttsLock = new Object();
     /** 当前正在播放的音轨，挂断时可以直接掐掉。 */
     private volatile AudioTrack activeTrack;
-    /**
-     * 0-9 和“来电话”提前合成就缓存起来。号码播报时直接拼接播放，
-     * 不需要等模型逐字生成，避免电话都挂了才念出来。
-     */
-    private final java.util.concurrent.ConcurrentHashMap<Character, float[]> digitAudioCache =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    private volatile float[] callTailAudio;
+    /** 合成音频的采样率，播报时按它播放。 */
     private volatile int ttsCacheRate = 22050;
-    private volatile boolean digitCacheReady = false;
 
     private final Runnable heartbeatRunnable = new Runnable() {
         @Override
@@ -258,9 +247,6 @@ public class VoiceService extends Service {
 
                 // 2. Load SherpaOnnx TTS model
                 initSherpaOnnxTts();
-
-                // 后台预热号码读音，来电时才能立刻播报
-                new Thread(this::buildDigitAudioCache, "tts-digit-cache").start();
 
                 // 3. Init AudioRecord
                 if (!initAudioRecord()) {
@@ -1256,6 +1242,8 @@ public class VoiceService extends Service {
 
         if (state == TelephonyManager.CALL_STATE_RINGING) {
             if (previous == TelephonyManager.CALL_STATE_RINGING) return;
+            // 先清掉上一轮的残留通知，避免把旧文案当成本次来电人
+            CallNotificationListener.clearIfStale();
             callerNumber = incomingNumber == null ? "" : incomingNumber.trim();
             if (callerNumber.isEmpty()) {
                 String screened = IncomingCallScreeningService.recentNumber();
@@ -1504,13 +1492,13 @@ public class VoiceService extends Service {
                 abortSpeech = false;
                 speaking = true;
                 try {
-                    // 在锁外等整句合成，prewarm 线程拿到锁才能干活
+                    // 整句合成：先等预热结果，等不到就现场合成，绝不退回单字拼接
                     float[] audio = waitForNumberAudio(digits, NUMBER_WAIT_MS);
+                    if (audio == null && !abortSpeech) {
+                        broadcastDebug("[tts] 预热未就绪，现场整句合成号码");
+                        audio = synthesizeNumber(digits, currentTts);
+                    }
                     synchronized (ttsLock) {
-                        if (audio == null) {
-                            broadcastDebug("[tts] 整句未就绪，改用数字拼接");
-                            audio = buildNumberAudio(digits, currentTts);
-                        }
                         if (audio != null && audio.length > 0 && !destroyed
                                 && epoch == speechEpoch && !abortSpeech) {
                             currentSpeechText = digits + "来电话";
@@ -1535,28 +1523,21 @@ public class VoiceService extends Service {
         }).start();
     }
 
-    /** 整句合成一个号码（“一，八，五，…，来电话”），并放进缓存。 */
+    /** 提前把号码整句合成好，来电时直接播。 */
     private void prewarmNumberAudio(String number) {
         final String digits = number == null ? "" : number.replaceAll("[^0-9]", "");
         if (digits.isEmpty()) return;
         if (cachedNumberAudio(digits) != null) return;
         OfflineTts currentTts = tts;
-        if (!ttsReady || currentTts == null) return;
-        if (destroyed) return;
-        try {
-            synchronized (ttsLock) {
-                if (cachedNumberAudio(digits) != null || destroyed) return;
-                GeneratedAudio audio = currentTts.generate(buildNumberSentence(digits), 0, DIGIT_SPEED);
-                if (audio != null && audio.getSamples() != null && audio.getSamples().length > 0) {
-                    putNumberAudio(digits, audio.getSamples());
-                    broadcastDebug("[tts] 号码整句合成完成（"
-                            + String.format(java.util.Locale.US, "%.1f", audio.getSamples().length
-                            / (float) audio.getSampleRate()) + "s）");
-                }
+        if (!ttsReady || currentTts == null || destroyed) return;
+        synchronized (ttsLock) {
+            if (cachedNumberAudio(digits) != null || destroyed) return;
+            float[] samples = synthesizeNumber(digits, currentTts);
+            if (samples != null) {
+                broadcastDebug("[tts] 号码整句合成完成（"
+                        + String.format(java.util.Locale.US, "%.1f",
+                        samples.length / (float) ttsCacheRate) + "s）");
             }
-        } catch (Exception e) {
-            broadcastDebug("[tts] 号码整句合成失败: " + e.getMessage());
-            Log.w(TAG, "prewarmNumberAudio failed", e);
         }
     }
 
@@ -1583,167 +1564,44 @@ public class VoiceService extends Service {
         }
     }
 
-    /** “一，八，五，六，零，一，八，一，一，四，五，来电话”，按 3-4-4 分组。 */
+    /**
+     * 号码按“3-4-4”分组念：“一八五，六零一八，一一四五，来电话”。
+     * 每个数字后面都加逗号会变成一字一顿（听起来像喘不上气），
+     * 组内连着念、组间停顿才像正常人报号码；其它长度每 4 位一组。
+     */
     private static String buildNumberSentence(String digits) {
         String[] table = {"零", "一", "二", "三", "四", "五", "六", "七", "八", "九"};
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < digits.length(); i++) {
-            if (i > 0) sb.append('，');
+            if (i > 0 && startsNewGroup(i, digits.length())) sb.append('，');
             sb.append(table[digits.charAt(i) - '0']);
         }
         sb.append("，来电话");
         return sb.toString();
     }
 
-    private float[] buildNumberAudio(String digits, OfflineTts currentTts) {
-        String[] table = {"零", "一", "二", "三", "四", "五", "六", "七", "八", "九"};
-
-        if (digitCacheReady) {
-            java.util.List<float[]> parts = new java.util.ArrayList<>();
-            int gap = Math.max(1, ttsCacheRate * DIGIT_GAP_MS / 1000);
-            int groupGap = Math.max(1, ttsCacheRate * DIGIT_GROUP_GAP_MS / 1000);
-            int lead = Math.max(1, ttsCacheRate * 150 / 1000);
-            int total = digits.length();
-            for (int i = 0; i < total; i++) {
-                float[] one = digitAudioCache.get(table[digits.charAt(i) - '0'].charAt(0));
-                if (one == null) {
-                    digitCacheReady = false;
-                    break;
-                }
-                parts.add(one);
-                if (i < total - 1) {
-                    parts.add(new float[groupBreakAfter(i, total) ? groupGap : gap]);
-                }
-            }
-            if (digitCacheReady && callTailAudio != null) {
-                parts.add(new float[lead]);
-                parts.add(callTailAudio);
-                return concat(parts);
-            }
-            parts.clear();
-        }
-
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < digits.length(); i++) {
-            if (i > 0) sb.append('，');
-            sb.append(table[digits.charAt(i) - '0']);
-        }
-        sb.append("，来电话");
-        GeneratedAudio audio = currentTts.generate(sb.toString(), 0, DIGIT_SPEED);
-        return audio != null ? audio.getSamples() : null;
+    private static boolean startsNewGroup(int index, int total) {
+        if (total == 11) return index == 3 || index == 7;
+        return index % 4 == 0;
     }
 
-    /** 11 位手机号按 3-4-4 分组，其余每 4 位一组。 */
-    private static boolean groupBreakAfter(int index, int total) {
-        if (total == 11) return index == 2 || index == 6;
-        return (index + 1) % 4 == 0 && index < total - 1;
-    }
-
-    /** 服务启动后把 0-9 和“来电话”预先合成好，来电时拼接即播。 */
-    private void buildDigitAudioCache() {
-        OfflineTts currentTts = tts;
-        if (currentTts == null || !ttsReady) return;
-
-        String[] table = {"零", "一", "二", "三", "四", "五", "六", "七", "八", "九"};
+    /** 整句合成一个号码，并放进缓存。缓存和现场合成走完全相同的文本，保证音质一致。 */
+    private float[] synthesizeNumber(String digits, OfflineTts currentTts) {
         try {
-            for (String digit : table) {
-                if (destroyed || tts != currentTts) return;
-                float[] samples = null;
-                int rate = ttsCacheRate;
-                synchronized (ttsLock) {
-                    // 带一个逗号一起合成：模型会用完整的降调收尾，
-                    // 单独念一个字会被截得很短，拼起来就像“喘不上气”
-                    GeneratedAudio audio = currentTts.generate(digit + "，", 0, DIGIT_SPEED);
-                    if (audio != null && audio.getSamples() != null && audio.getSamples().length > 0) {
-                        rate = audio.getSampleRate();
-                        samples = prepareClip(audio.getSamples(), rate);
-                    }
-                }
-                if (samples != null) {
-                    digitAudioCache.put(digit.charAt(0), samples);
-                    ttsCacheRate = rate;
-                }
+            GeneratedAudio audio = currentTts.generate(buildNumberSentence(digits), 0, DIGIT_SPEED);
+            if (audio == null || audio.getSamples() == null || audio.getSamples().length == 0) {
+                return null;
             }
-            float[] tail = null;
-            synchronized (ttsLock) {
-                GeneratedAudio audio = currentTts.generate("来电话", 0, 1.0f);
-                if (audio != null && audio.getSamples() != null && audio.getSamples().length > 0) {
-                    tail = prepareClip(audio.getSamples(), audio.getSampleRate());
-                }
-            }
-            if (tail != null) callTailAudio = tail;
-            digitCacheReady = digitAudioCache.size() >= 10 && callTailAudio != null;
-            broadcastDebug("[tts] 号码读音缓存" + (digitCacheReady ? "就绪" : "不完整")
-                    + "（" + digitAudioCache.size() + " 个数字）");
+            ttsCacheRate = audio.getSampleRate();
+            float[] samples = audio.getSamples();
+            putNumberAudio(digits, samples);
+            return samples;
         } catch (Exception e) {
-            broadcastDebug("[tts] 号码读音缓存失败: " + e.getMessage());
-            Log.e(TAG, "buildDigitAudioCache failed", e);
+            broadcastDebug("[tts-error] 号码合成失败: " + e.getMessage());
+            return null;
         }
     }
 
-    /** 裁掉首尾多余静音、加淡入淡出、统一响度，拼接时就不会一顿一顿的。 */
-    private static float[] prepareClip(float[] samples, int rate) {
-        float[] trimmed = trimSilence(samples, 0.03f, 30, 50, rate);
-        if (trimmed == null || trimmed.length == 0) return samples;
-        applyFade(trimmed, rate * 8 / 1000, rate * 12 / 1000);
-        return normalizeLoudness(trimmed, 0.085f);
-    }
-
-    private static float[] trimSilence(float[] samples, float ratio, int headMs, int tailMs, int rate) {
-        if (samples == null || samples.length == 0) return samples;
-        float peak = 0f;
-        for (float v : samples) peak = Math.max(peak, Math.abs(v));
-        if (peak < 0.0001f) return samples;
-        float threshold = peak * ratio;
-        int start = 0;
-        while (start < samples.length && Math.abs(samples[start]) < threshold) start++;
-        int end = samples.length - 1;
-        while (end > start && Math.abs(samples[end]) < threshold) end--;
-        int from = Math.max(0, start - rate * headMs / 1000);
-        int to = Math.min(samples.length, end + 1 + rate * tailMs / 1000);
-        if (to <= from) return samples;
-        return java.util.Arrays.copyOfRange(samples, from, to);
-    }
-
-    private static void applyFade(float[] samples, int fadeIn, int fadeOut) {
-        int in = Math.min(fadeIn, samples.length / 2);
-        for (int i = 0; i < in; i++) {
-            samples[i] *= (float) i / in;
-        }
-        int out = Math.min(fadeOut, samples.length / 2);
-        for (int i = 0; i < out; i++) {
-            samples[samples.length - 1 - i] *= (float) i / out;
-        }
-    }
-
-    private static float[] normalizeLoudness(float[] samples, float targetRms) {
-        double sum = 0;
-        float peak = 0f;
-        for (float v : samples) {
-            sum += (double) v * v;
-            peak = Math.max(peak, Math.abs(v));
-        }
-        if (peak < 0.0001f) return samples;
-        float rms = (float) Math.sqrt(sum / samples.length);
-        float gain = rms > 0.0001f ? targetRms / rms : 1f;
-        gain = Math.min(gain, 4f);
-        if (peak * gain > 0.95f) gain = 0.95f / peak;
-        float[] out = new float[samples.length];
-        for (int i = 0; i < samples.length; i++) out[i] = samples[i] * gain;
-        return out;
-    }
-
-    private static float[] concat(java.util.List<float[]> parts) {
-        int total = 0;
-        for (float[] part : parts) total += part.length;
-        float[] merged = new float[total];
-        int offset = 0;
-        for (float[] part : parts) {
-            System.arraycopy(part, 0, merged, offset, part.length);
-            offset += part.length;
-        }
-        return merged;
-    }
 
     private void logCallPermissions() {
         boolean notif = CallNotificationListener.isEnabled(this);
@@ -1752,6 +1610,11 @@ public class VoiceService extends Service {
                 + " 通知使用权=" + (notif ? "已开启" : "未开启（姓名和接听都要用它）"));
         if (!notif) {
             broadcastDebug("[来电] 请在应用里开启“通知使用权”，否则只能念号码、也无法接听");
+            return;
+        }
+        String raw = CallNotificationListener.lastRaw();
+        if (raw != null && !raw.isEmpty()) {
+            broadcastDebug("[来电] 通知原文: " + raw);
         }
     }
 

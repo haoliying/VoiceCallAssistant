@@ -72,6 +72,15 @@
                 android:textColor="#444444"
                 android:layout_marginBottom="8dp" />
 
+            <TextView
+                android:id="@+id/tvLastNotif"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="最近来电通知：暂无"
+                android:textSize="12sp"
+                android:textColor="#666666"
+                android:layout_marginBottom="8dp" />
+
             <Button
                 android:id="@+id/btnPermissions"
                 android:layout_width="match_parent"

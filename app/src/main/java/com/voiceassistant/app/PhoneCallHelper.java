@@ -3,8 +3,10 @@ package com.voiceassistant.app;
 import android.Manifest;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.media.AudioManager;
 import android.os.Build;
 import android.telecom.TelecomManager;
+import android.view.KeyEvent;
 import android.telephony.TelephonyManager;
 import android.util.Log;
 
@@ -48,13 +50,17 @@ final class PhoneCallHelper {
         List<String> tried = new ArrayList<>();
 
         // 1. 通知栏上的“接听”按钮：不需要通话权限，成功率最高
-        if (CallNotificationListener.isEnabled(context) && CallNotificationListener.acceptCall()) {
-            tried.add("通知栏按钮");
-            if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1500)) {
-                result.onResult(true, "已通过通知栏的接听按钮接听");
-                return true;
+        if (CallNotificationListener.isEnabled(context)) {
+            if (CallNotificationListener.acceptCall()) {
+                tried.add("通知栏按钮");
+                if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 3000)) {
+                    result.onResult(true, "已通过通知栏的接听按钮接听");
+                    return true;
+                }
+                Log.w(TAG, "notification answer action did not take effect");
             }
-            Log.w(TAG, "notification answer action did not take effect");
+        } else {
+            tried.add("通知使用权未开启");
         }
 
         if (!hasPermission(context, Manifest.permission.ANSWER_PHONE_CALLS)) {
@@ -71,7 +77,7 @@ final class PhoneCallHelper {
         } catch (Exception e) {
             Log.w(TAG, "acceptRingingCall failed", e);
         }
-        if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1500)) {
+        if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 2000)) {
             result.onResult(true, "已通过系统接口接听");
             return true;
         }
@@ -79,24 +85,61 @@ final class PhoneCallHelper {
         // 3. 旧版 ITelephony 接口
         if (invokeITelephony(context, "answerRingingCall")) {
             tried.add("兼容接口");
-            if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1000)) {
+            if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1500)) {
                 result.onResult(true, "已通过兼容方式接听");
                 return true;
             }
         }
 
-        // 4. 无障碍服务点击系统的接听按钮
-        if (CallAccessibilityService.clickAnswer()) {
-            tried.add("无障碍点击");
-            if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1500)) {
-                result.onResult(true, "已通过无障碍服务接听");
+        // 4. 耳机接听键：不少 ROM 会把它当成“接听”。正在放音乐时不发，
+        //    否则可能被音乐播放器当成播放/暂停。
+        if (sendHeadsetHook(context)) {
+            tried.add("耳机键");
+            if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 2500)) {
+                result.onResult(true, "已通过耳机键接听");
                 return true;
             }
         }
 
+        // 5. 无障碍服务点击系统的接听按钮，来电界面可能晚一点出现，多点几次
+        if (CallAccessibilityService.isRunning()) {
+            tried.add("无障碍点击");
+            for (int attempt = 0; attempt < 3; attempt++) {
+                if (CallAccessibilityService.clickAnswer()
+                        && waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1200)) {
+                    result.onResult(true, "已通过无障碍服务接听");
+                    return true;
+                }
+                sleepQuietly(400);
+            }
+        } else if (CallAccessibilityService.isEnabledInSettings(context)) {
+            tried.add("无障碍未运行");
+        }
+
         result.onResult(false, "接听没有被系统接受（已尝试: " + join(tried)
-                + "）。请在应用里开启“通知使用权”或无障碍服务，或手动接听");
+                + "）。请确认已开启“通知使用权”和“无障碍服务”，或在系统设置里允许本应用接听电话");
         return false;
+    }
+
+    /**
+     * 发送耳机按键事件。响铃时很多 ROM 会把它当成“接听”。
+     * 正在播放音乐时跳过，避免误触播放器的播放/暂停。
+     */
+    private static boolean sendHeadsetHook(Context context) {
+        try {
+            AudioManager audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+            if (audioManager == null || audioManager.isMusicActive()) return false;
+            long now = android.os.SystemClock.uptimeMillis();
+            KeyEvent down = new KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_HEADSETHOOK, 0);
+            KeyEvent up = new KeyEvent(now, now + 80, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_HEADSETHOOK, 0);
+            audioManager.dispatchMediaKeyEvent(down);
+            sleepQuietly(80);
+            audioManager.dispatchMediaKeyEvent(up);
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "headset hook failed", e);
+            return false;
+        }
     }
 
     /** 挂断当前通话或拒接来电。 */
@@ -181,6 +224,14 @@ final class PhoneCallHelper {
             Log.w(TAG, "getCallState failed", e);
         }
         return TelephonyManager.CALL_STATE_IDLE;
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private static String join(List<String> items) {
