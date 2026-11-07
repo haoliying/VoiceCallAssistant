@@ -31,6 +31,45 @@ public class CallNotificationListener extends NotificationListenerService {
     private static volatile String pendingNumber;
     private static volatile String pendingName;
     private static volatile long capturedAt;
+    /** 来电通知上的操作按钮（接听/挂断），系统不允许第三方直接操作通话时用它兜底。 */
+    private static volatile List<Notification.Action> callActions;
+    private static volatile long callActionsAt;
+
+    private static final String[] ANSWER_KEYWORDS = {"接听", "接电话", "应答", "answer", "accept"};
+    private static final String[] DECLINE_KEYWORDS = {"挂断", "拒接", "结束通话", "decline", "reject", "hang up", "end call"};
+
+    /** 点击来电通知上的“接听”按钮。 */
+    static boolean acceptCall() {
+        return sendAction(ANSWER_KEYWORDS);
+    }
+
+    /** 点击来电通知上的“挂断/拒接”按钮。 */
+    static boolean declineCall() {
+        return sendAction(DECLINE_KEYWORDS);
+    }
+
+    private static boolean sendAction(String[] keywords) {
+        List<Notification.Action> actions = callActions;
+        if (actions == null || System.currentTimeMillis() - callActionsAt > VALID_MS) return false;
+        for (Notification.Action action : actions) {
+            if (action == null || action.actionIntent == null) continue;
+            CharSequence title = action.title;
+            if (title == null) continue;
+            String value = title.toString().toLowerCase();
+            for (String keyword : keywords) {
+                if (value.contains(keyword)) {
+                    try {
+                        action.actionIntent.send();
+                        Log.i(TAG, "sent call action: " + title);
+                        return true;
+                    } catch (Exception e) {
+                        Log.w(TAG, "send call action failed", e);
+                    }
+                }
+            }
+        }
+        return false;
+    }
 
     /** 最近 30 秒内从通话通知里抓到的号码，没有则返回 null。 */
     static String recentNumber() {
@@ -65,6 +104,8 @@ public class CallNotificationListener extends NotificationListenerService {
         pendingNumber = null;
         pendingName = null;
         capturedAt = 0L;
+        callActions = null;
+        callActionsAt = 0L;
     }
 
     @Override
@@ -75,6 +116,10 @@ public class CallNotificationListener extends NotificationListenerService {
             if (notification.category == null
                     || !Notification.CATEGORY_CALL.equals(notification.category)) {
                 return;
+            }
+            if (notification.actions != null && notification.actions.length > 0) {
+                callActions = java.util.Arrays.asList(notification.actions);
+                callActionsAt = System.currentTimeMillis();
             }
             Bundle extras = notification.extras;
             if (extras == null) return;

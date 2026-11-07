@@ -25,6 +25,10 @@ public class CallAccessibilityService extends AccessibilityService {
             "挂断", "结束通话", "挂断电话", "结束", "end call", "hang up", "disconnect"
     };
 
+    private static final String[] ANSWER_LABELS = {
+            "接听", "接听电话", "接电话", "应答", "answer", "accept"
+    };
+
     private static volatile CallAccessibilityService instance;
 
     public static boolean isRunning() {
@@ -46,38 +50,47 @@ public class CallAccessibilityService extends AccessibilityService {
 
     /** 请求点击通话界面上的挂断按钮。 */
     static boolean clickHangUp() {
+        return clickLabels(HANG_UP_LABELS, "hang up");
+    }
+
+    /** 请求点击来电界面上的接听按钮（部分系统会拦截第三方接听）。 */
+    static boolean clickAnswer() {
+        return clickLabels(ANSWER_LABELS, "answer");
+    }
+
+    private static boolean clickLabels(String[] labels, String what) {
         CallAccessibilityService service = instance;
         if (service == null) return false;
         try {
             AccessibilityNodeInfo root = service.getRootInActiveWindow();
-            if (root != null && service.clickInTree(root)) {
-                Log.i(TAG, "hang up clicked in active window");
+            if (root != null && service.clickInTree(root, labels)) {
+                Log.i(TAG, what + " clicked in active window");
                 return true;
             }
             List<android.view.accessibility.AccessibilityWindowInfo> windows = service.getWindows();
             if (windows != null) {
                 for (android.view.accessibility.AccessibilityWindowInfo window : windows) {
                     AccessibilityNodeInfo windowRoot = window.getRoot();
-                    if (windowRoot != null && service.clickInTree(windowRoot)) {
-                        Log.i(TAG, "hang up clicked in window " + window.getId());
+                    if (windowRoot != null && service.clickInTree(windowRoot, labels)) {
+                        Log.i(TAG, what + " clicked in window " + window.getId());
                         return true;
                     }
                 }
             }
         } catch (Exception e) {
-            Log.w(TAG, "clickHangUp failed", e);
+            Log.w(TAG, "click " + what + " failed", e);
         }
         return false;
     }
 
-    private boolean clickInTree(AccessibilityNodeInfo root) {
+    private boolean clickInTree(AccessibilityNodeInfo root, String[] labels) {
         ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
         queue.add(root);
         int guard = 0;
         while (!queue.isEmpty() && guard++ < 400) {
             AccessibilityNodeInfo node = queue.poll();
             if (node == null) continue;
-            if (matchesHangUp(node) && click(node)) return true;
+            if (matches(node, labels) && click(node)) return true;
 
             for (int i = 0; i < node.getChildCount(); i++) {
                 AccessibilityNodeInfo child = node.getChild(i);
@@ -87,10 +100,10 @@ public class CallAccessibilityService extends AccessibilityService {
         return false;
     }
 
-    private boolean matchesHangUp(AccessibilityNodeInfo node) {
+    private boolean matches(AccessibilityNodeInfo node, String[] labels) {
         CharSequence text = node.getText();
         CharSequence description = node.getContentDescription();
-        for (String label : HANG_UP_LABELS) {
+        for (String label : labels) {
             if (contains(text, label) || contains(description, label)) return true;
         }
         return false;

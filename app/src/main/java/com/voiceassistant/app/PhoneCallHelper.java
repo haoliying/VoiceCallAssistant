@@ -51,7 +51,47 @@ final class PhoneCallHelper {
         }
         // PhoneLookup 没命中时，再按号码后 8 位模糊找一次，
         // 覆盖通讯录里存成“138 0013 8000”“+86 138…”这类格式的号码
-        return queryNameBySuffix(context, candidates);
+        String bySuffix = queryNameBySuffix(context, candidates);
+        if (bySuffix != null) return bySuffix;
+
+        // 通话记录里系统自己缓存过姓名，顺带抄一份
+        String cached = queryCallLogName(context, candidates);
+        if (cached != null) return cached;
+
+        // 最后用本地索引（Java 侧归一化后比对），兼容任何分隔符、全角数字
+        return ContactsIndex.lookup(context, number);
+    }
+
+    /** 通话记录里系统解析出的联系人姓名（需要“通话记录”权限）。 */
+    private static String queryCallLogName(Context context, java.util.List<String> candidates) {
+        if (!hasPermission(context, Manifest.permission.READ_CALL_LOG)) return null;
+        for (String candidate : candidates) {
+            if (candidate.length() < 7) continue;
+            String suffix = "%" + candidate.substring(candidate.length() - 7);
+            android.database.Cursor cursor = null;
+            try {
+                cursor = context.getContentResolver().query(
+                        android.provider.CallLog.Calls.CONTENT_URI,
+                        new String[]{android.provider.CallLog.Calls.CACHED_NAME},
+                        android.provider.CallLog.Calls.NUMBER + " LIKE ?",
+                        new String[]{suffix},
+                        android.provider.CallLog.Calls.DATE + " DESC");
+                if (cursor != null && cursor.moveToFirst()) {
+                    String name = cursor.getString(0);
+                    if (name != null && !name.trim().isEmpty()
+                            && !ContactsIndex.normalize(name).equals(candidate)) {
+                        return name.trim();
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "queryCallLogName failed", e);
+            } finally {
+                if (cursor != null) {
+                    try { cursor.close(); } catch (Exception ignored) { }
+                }
+            }
+        }
+        return null;
     }
 
     private static String queryNameBySuffix(Context context, java.util.List<String> candidates) {
@@ -119,12 +159,13 @@ final class PhoneCallHelper {
         return null;
     }
 
-    /** 接听正在响铃的电话。 */
+    /** 接听正在响铃的电话。系统接口 -> 旧接口 -> 通知按钮 -> 无障碍点击，逐级兜底。 */
     static boolean answerCall(Context context, Result result) {
         if (!hasPermission(context, Manifest.permission.ANSWER_PHONE_CALLS)) {
-            result.onResult(false, "缺少接听电话权限");
+            result.onResult(false, "缺少“接听电话”权限，请在应用里授予");
             return false;
         }
+        String firstError = null;
         try {
             TelecomManager telecom = (TelecomManager) context.getSystemService(Context.TELECOM_SERVICE);
             if (telecom != null) {
@@ -133,9 +174,10 @@ final class PhoneCallHelper {
                 return true;
             }
         } catch (SecurityException e) {
-            result.onResult(false, "系统拒绝接听: " + e.getMessage());
-            return false;
+            firstError = e.getMessage();
+            Log.w(TAG, "acceptRingingCall denied: " + firstError);
         } catch (Exception e) {
+            firstError = e.getMessage();
             Log.w(TAG, "acceptRingingCall failed", e);
         }
 
@@ -144,7 +186,18 @@ final class PhoneCallHelper {
             result.onResult(true, "已通过兼容方式接听");
             return true;
         }
-        result.onResult(false, "接听失败，请在系统设置里允许本应用接听电话");
+        // 来电通知上的“接听”按钮
+        if (CallNotificationListener.acceptCall()) {
+            result.onResult(true, "已通过通知栏按钮接听");
+            return true;
+        }
+        // 最后让无障碍服务去点系统通话界面上的接听按钮
+        if (CallAccessibilityService.clickAnswer()) {
+            result.onResult(true, "已通过无障碍服务接听");
+            return true;
+        }
+        result.onResult(false, "接听失败" + (firstError == null ? "" : "（" + firstError + "）")
+                + "，请开启“通知使用权”或无障碍辅助功能");
         return false;
     }
 
@@ -166,6 +219,11 @@ final class PhoneCallHelper {
 
         if (invokeITelephony(context, "endCall")) {
             result.onResult(true, "已通过兼容方式挂断");
+            return true;
+        }
+
+        if (CallNotificationListener.declineCall()) {
+            result.onResult(true, "已通过通知栏按钮挂断");
             return true;
         }
 
