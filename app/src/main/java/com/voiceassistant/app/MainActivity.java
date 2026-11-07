@@ -8,6 +8,8 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.app.role.RoleManager;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -160,6 +162,22 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        findViewById(R.id.btnCopyLog).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                copyLogToClipboard();
+            }
+        });
+
+        // 长按日志区域也能复制，方便反馈问题
+        tvDebug.setOnLongClickListener(new View.OnLongClickListener() {
+            @Override
+            public boolean onLongClick(View v) {
+                copyLogToClipboard();
+                return true;
+            }
+        });
+
         findViewById(R.id.btnContactTest).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -191,6 +209,7 @@ public class MainActivity extends AppCompatActivity {
         manager.registerReceiver(statusReceiver, new IntentFilter(VoiceService.ACTION_STATUS));
         manager.registerReceiver(debugReceiver, new IntentFilter(VoiceService.ACTION_DEBUG));
         manager.registerReceiver(callReceiver, new IntentFilter(VoiceService.ACTION_CALL));
+        refreshLogFromStore();
         refreshServiceState();
         updatePermissionSummary();
     }
@@ -310,6 +329,46 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "在列表里找到“语音助手挂断辅助”并开启", Toast.LENGTH_LONG).show();
         } catch (Exception e) {
             appendDebug("无法打开无障碍设置: " + e.getMessage());
+        }
+    }
+
+    /** 界面重新打开时，把后台期间产生的日志补齐到显示区。 */
+    private void refreshLogFromStore() {
+        String history = LogStore.dump();
+        if (history == null || history.isEmpty()) return;
+        String[] lines = history.split("\n");
+        int start = Math.max(0, lines.length - MAX_DEBUG_LINES);
+        debugLog.setLength(0);
+        for (int i = start; i < lines.length; i++) {
+            if (lines[i].isEmpty()) continue;
+            debugLog.append(lines[i]).append("\n");
+        }
+        tvDebug.setText(debugLog.toString());
+    }
+
+    /** 把日志和当前权限状态一起复制到剪贴板，方便反馈。 */
+    private void copyLogToClipboard() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("=== 语音电话助手 ").append(BuildConfig.VERSION_NAME).append(" ===\n");
+        sb.append("录音=").append(stateOf(Manifest.permission.RECORD_AUDIO));
+        sb.append(" 电话状态=").append(stateOf(Manifest.permission.READ_PHONE_STATE));
+        sb.append(" 联系人=").append(stateOf(Manifest.permission.READ_CONTACTS));
+        sb.append(" 通话记录=").append(stateOf(Manifest.permission.READ_CALL_LOG)).append("\n");
+        sb.append("来电筛选=").append(IncomingCallScreeningService.isEnabled(this) ? "已开启" : "未开启");
+        sb.append(" 通知使用权=").append(CallNotificationListener.isEnabled(this) ? "已开启" : "未开启");
+        sb.append(" 无障碍=").append(CallAccessibilityService.isEnabledInSettings(this) ? "已开启" : "未开启");
+        sb.append("\n--- 日志 ---\n");
+        // 用服务侧的共享缓冲：界面没打开时的来电日志也在里面
+        sb.append(LogStore.dump());
+
+        try {
+            ClipboardManager manager = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (manager != null) {
+                manager.setPrimaryClip(ClipData.newPlainText("voice-assistant-log", sb.toString()));
+                Toast.makeText(this, "已复制到剪贴板，粘贴发给我即可", Toast.LENGTH_LONG).show();
+            }
+        } catch (Exception e) {
+            Toast.makeText(this, "复制失败: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
     }
 

@@ -10,8 +10,8 @@ android {
         applicationId "com.voiceassistant.app"
         minSdk 26
         targetSdk 34
-        versionCode 3
-        versionName "1.2"
+        versionCode 4
+        versionName "1.3"
 
         // sherpa-onnx 只提供了 arm64-v8a 的库，其它架构的 Vosk 库没有用，去掉可以减小安装包
         ndk {
@@ -24,6 +24,10 @@ android {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 
     compileOptions {

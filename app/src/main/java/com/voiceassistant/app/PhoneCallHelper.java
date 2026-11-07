@@ -6,6 +6,7 @@ import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.provider.ContactsContract;
+import android.provider.ContactsContract.CommonDataKinds;
 import android.telecom.TelecomManager;
 import android.telephony.TelephonyManager;
 import android.util.Log;
@@ -43,9 +44,41 @@ final class PhoneCallHelper {
         if (!hasPermission(context, Manifest.permission.READ_CONTACTS)) return null;
 
         // 同一个号码可能存成 +8613800138000 / 13800138000，逐个候选值试一遍
-        for (String candidate : candidates(number)) {
+        java.util.List<String> candidates = candidates(number);
+        for (String candidate : candidates) {
             String name = queryName(context, candidate);
             if (name != null) return name;
+        }
+        // PhoneLookup 没命中时，再按号码后 8 位模糊找一次，
+        // 覆盖通讯录里存成“138 0013 8000”“+86 138…”这类格式的号码
+        return queryNameBySuffix(context, candidates);
+    }
+
+    private static String queryNameBySuffix(Context context, java.util.List<String> candidates) {
+        for (String candidate : candidates) {
+            if (candidate.length() < 8) continue;
+            String suffix = candidate.substring(candidate.length() - 8);
+            android.database.Cursor cursor = null;
+            try {
+                String normalizedColumn = "REPLACE(REPLACE(REPLACE("
+                        + CommonDataKinds.Phone.NUMBER + ",' ',''),'-',''),'+','')";
+                cursor = context.getContentResolver().query(
+                        CommonDataKinds.Phone.CONTENT_URI,
+                        new String[]{CommonDataKinds.Phone.DISPLAY_NAME},
+                        normalizedColumn + " LIKE ?",
+                        new String[]{"%" + suffix},
+                        null);
+                if (cursor != null && cursor.moveToFirst()) {
+                    String name = cursor.getString(0);
+                    if (name != null && !name.trim().isEmpty()) return name.trim();
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "queryNameBySuffix failed", e);
+            } finally {
+                if (cursor != null) {
+                    try { cursor.close(); } catch (Exception ignored) { }
+                }
+            }
         }
         return null;
     }
@@ -171,6 +204,6 @@ final class PhoneCallHelper {
         if (number == null) return "";
         String digits = number.replaceAll("[^0-9]", "");
         if (digits.length() <= 4) return digits;
-        return digits.substring(0, 3) + "****" + digits.substring(digits.length() - 2);
+        return digits.substring(0, 3) + "****" + digits.substring(digits.length() - 4);
     }
 }
