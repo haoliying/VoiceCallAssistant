@@ -173,21 +173,22 @@ public class CallNotificationListener extends NotificationListenerService {
             }
         }
         if (Notification.CATEGORY_CALL.equals(notification.category)) return true;
-        if (hasAnswerAction) return true;
-        if (!hasNumber) return false;
         String pkg = sbn.getPackageName();
-        if (pkg != null) {
-            String lower = pkg.toLowerCase(Locale.ROOT);
-            return lower.contains("dialer") || lower.contains("telecom")
-                    || lower.contains("incallui") || lower.endsWith(".phone");
-        }
-        return false;
+        String lower = pkg == null ? "" : pkg.toLowerCase(Locale.ROOT);
+        boolean fromPhoneApp = lower.contains("dialer") || lower.contains("telecom")
+                || lower.contains("incallui") || lower.endsWith(".phone");
+        if (fromPhoneApp && (hasNumber || hasAnswerAction)) return true;
+        // 其它应用（包括部分 ROM 的通话界面）只有同时出现号码和接听按钮时才认
+        return hasNumber && hasAnswerAction;
     }
 
     @Override
     public void onNotificationPosted(StatusBarNotification sbn) {
         try {
             if (sbn == null || sbn.getNotification() == null) return;
+            // 绝不能读自己的通知：本应用的通知也带“接听/挂断”按钮，
+            // 一旦被当成来电通知，点自己的按钮就会再次触发接听，形成死循环
+            if (getPackageName().equals(sbn.getPackageName())) return;
             Notification notification = sbn.getNotification();
             Bundle extras = notification.extras;
 

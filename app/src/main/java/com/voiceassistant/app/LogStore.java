@@ -19,13 +19,27 @@ final class LogStore {
 
     private LogStore() {}
 
+    private static String lastMessage;
+    private static String lastLine;
+    private static int repeatCount;
+
     static void append(String message) {
         if (message == null) return;
-        String line;
-        synchronized (TIME) {
-            line = "[" + TIME.format(new Date()) + "] " + message;
-        }
         synchronized (LINES) {
+            // 连续重复的消息只累计次数：万一有循环，也不会把前面的日志冲掉
+            if (message.equals(lastMessage)) {
+                repeatCount++;
+                if (!LINES.isEmpty()) LINES.removeLast();
+                LINES.addLast(lastLine + "（重复" + (repeatCount + 1) + "次）");
+                return;
+            }
+            String line;
+            synchronized (TIME) {
+                line = "[" + TIME.format(new Date()) + "] " + message;
+            }
+            lastMessage = message;
+            lastLine = line;
+            repeatCount = 0;
             LINES.addLast(line);
             while (LINES.size() > MAX_LINES) {
                 LINES.removeFirst();
@@ -36,6 +50,9 @@ final class LogStore {
     static void clear() {
         synchronized (LINES) {
             LINES.clear();
+            lastMessage = null;
+            lastLine = null;
+            repeatCount = 0;
         }
     }
 

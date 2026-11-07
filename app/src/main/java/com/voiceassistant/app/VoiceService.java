@@ -157,6 +157,9 @@ public class VoiceService extends Service {
     private volatile int speechEpoch = 0;
     /** 这一通电话是否已经提示过“无法接听”，避免反复喊。 */
     private volatile boolean answerFailureReported = false;
+    /** 本次响铃已经尝试接听的次数，防止任何来源的重复触发。 */
+    private volatile int answerAttempts = 0;
+    private volatile long lastAnswerAttemptAt = 0L;
     private volatile long answerFailedAt = 0L;
     /**
      * 整个号码一句话合成好的音频（按号码缓存 6 条）。
@@ -1252,6 +1255,8 @@ public class VoiceService extends Service {
             callerName = null;
             answerFailureReported = false;
             answerFailedAt = 0L;
+            answerAttempts = 0;
+            lastAnswerAttemptAt = 0L;
             logCallPermissions();
             startRingAnnouncements();
         } else if (state == TelephonyManager.CALL_STATE_OFFHOOK) {
@@ -1627,11 +1632,26 @@ public class VoiceService extends Service {
             broadcastDebug("[来电] 当前没有响铃的来电，忽略接听");
             return;
         }
+        // 指令、通知按钮、重试都可能同时触发，同一时刻只允许一次接听
+        if (answering) {
+            broadcastDebug("[来电] 正在接听中，忽略重复请求");
+            return;
+        }
         long now = SystemClock.elapsedRealtime();
         if (now - answerFailedAt < 5000L) {
             broadcastDebug("[来电] 刚才接听失败了，请手动接听");
             return;
         }
+        if (now - lastAnswerAttemptAt < 3000L) {
+            broadcastDebug("[来电] 接听请求太频繁，稍后再试");
+            return;
+        }
+        if (answerAttempts >= 3) {
+            broadcastDebug("[来电] 本次来电已尝试接听 3 次，不再自动重试");
+            return;
+        }
+        answerAttempts++;
+        lastAnswerAttemptAt = now;
         stopRingAnnouncements();
         answering = true;
         broadcastDebug("[来电] 执行接听...");
@@ -1644,7 +1664,7 @@ public class VoiceService extends Service {
                     // 只提示一次，避免一直重复；电话已经结束时不再出声
                     if (!answerFailureReported) {
                         answerFailureReported = true;
-                        speak("无法接听，请手动接听");
+                        speak("没能接通，请手动操作");
                     }
                     handler.postDelayed(ringAnnouncer, 1500L);
                 });
