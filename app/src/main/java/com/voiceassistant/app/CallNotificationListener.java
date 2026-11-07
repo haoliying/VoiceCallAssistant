@@ -148,18 +148,29 @@ public class CallNotificationListener extends NotificationListenerService {
                     return;
                 }
             }
-            // 没有号码，但标题像个人名，也可以用来播报
-            if (!texts.isEmpty()) {
-                String title = texts.get(0).toString().trim();
-                if (title.length() >= 2 && title.length() <= 20 && !containsDigit(title)) {
-                    pendingName = title;
+            // 没有号码，但通知里有像人名的文字，也可以用来播报
+            for (CharSequence text : texts) {
+                String name = cleanName(text.toString());
+                if (name != null) {
+                    pendingName = name;
                     capturedAt = System.currentTimeMillis();
                     Log.i(TAG, "captured caller name from notification");
+                    return;
                 }
             }
         } catch (Exception e) {
             Log.w(TAG, "onNotificationPosted failed", e);
         }
+    }
+
+    /** 去掉“来电/电话”等字样，剩下 2-20 个非数字字符才当成姓名。 */
+    private static String cleanName(String raw) {
+        if (raw == null) return null;
+        String value = raw.replaceAll("(?i)(来电|电话|语音通话|视频通话|incoming call|voip)", "")
+                .replaceAll("[\\[\\]（）()<>《》\\s]", "")
+                .trim();
+        if (value.length() < 2 || value.length() > 20) return null;
+        return containsDigit(value) ? null : value;
     }
 
     private void addText(List<CharSequence> list, CharSequence value) {
@@ -168,7 +179,7 @@ public class CallNotificationListener extends NotificationListenerService {
         if (!TextUtils.isEmpty(text)) list.add(value);
     }
 
-    private boolean containsDigit(String value) {
+    private static boolean containsDigit(String value) {
         for (int i = 0; i < value.length(); i++) {
             if (Character.isDigit(value.charAt(i))) return true;
         }

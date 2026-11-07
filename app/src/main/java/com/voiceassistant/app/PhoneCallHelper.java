@@ -12,6 +12,8 @@ import android.telephony.TelephonyManager;
 import android.util.Log;
 
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * 来电相关能力：号码 -> 联系人名字、接听、挂断。
@@ -23,6 +25,9 @@ import java.lang.reflect.Method;
 final class PhoneCallHelper {
 
     private static final String TAG = "PhoneCallHelper";
+
+    /** 上一次查询命中的来源，方便日志定位。 */
+    static volatile String lastSource = "";
 
     interface Result {
         void onResult(boolean success, String message);
@@ -40,6 +45,7 @@ final class PhoneCallHelper {
 
     /** 号码能查到联系人姓名就返回姓名，查不到返回 null（陌生号码）。 */
     static String lookupContactName(Context context, String number) {
+        lastSource = "";
         if (number == null || number.trim().isEmpty()) return null;
         if (!hasPermission(context, Manifest.permission.READ_CONTACTS)) return null;
 
@@ -47,19 +53,29 @@ final class PhoneCallHelper {
         java.util.List<String> candidates = candidates(number);
         for (String candidate : candidates) {
             String name = queryName(context, candidate);
-            if (name != null) return name;
+            if (name != null) {
+                lastSource = "系统 PhoneLookup";
+                return name;
+            }
         }
-        // PhoneLookup 没命中时，再按号码后 8 位模糊找一次，
-        // 覆盖通讯录里存成“138 0013 8000”“+86 138…”这类格式的号码
-        String bySuffix = queryNameBySuffix(context, candidates);
-        if (bySuffix != null) return bySuffix;
+        // 本地索引：号码归一化后按国内/国际写法整号比对，不做位数截断
+        String indexed = ContactsIndex.lookup(context, number);
+        if (indexed != null) {
+            lastSource = "本地通讯录索引";
+            return indexed;
+        }
 
         // 通话记录里系统自己缓存过姓名，顺带抄一份
         String cached = queryCallLogName(context, candidates);
-        if (cached != null) return cached;
+        if (cached != null) {
+            lastSource = "通话记录缓存";
+            return cached;
+        }
 
-        // 最后用本地索引（Java 侧归一化后比对），兼容任何分隔符、全角数字
-        return ContactsIndex.lookup(context, number);
+        // 最后的兜底：按号码后 8 位模糊找一次，只用于“通讯录只存了局号”的固话
+        String bySuffix = queryNameBySuffix(context, candidates);
+        if (bySuffix != null) lastSource = "号码后 8 位";
+        return bySuffix;
     }
 
     /** 通话记录里系统解析出的联系人姓名（需要“通话记录”权限）。 */
@@ -159,83 +175,154 @@ final class PhoneCallHelper {
         return null;
     }
 
-    /** 接听正在响铃的电话。系统接口 -> 旧接口 -> 通知按钮 -> 无障碍点击，逐级兜底。 */
+    /**
+     * 接听正在响铃的电话。
+     *
+     * 很多 ROM 上 TelecomManager.acceptRingingCall() 不抛异常但也不生效，
+     * 所以每一步都要用 getCallState() 验证，失败再换下一种方式。
+     */
     static boolean answerCall(Context context, Result result) {
         if (!hasPermission(context, Manifest.permission.ANSWER_PHONE_CALLS)) {
             result.onResult(false, "缺少“接听电话”权限，请在应用里授予");
             return false;
         }
-        String firstError = null;
-        try {
-            TelecomManager telecom = (TelecomManager) context.getSystemService(Context.TELECOM_SERVICE);
-            if (telecom != null) {
-                telecom.acceptRingingCall();
-                result.onResult(true, "已发送接听指令");
+        List<String> tried = new ArrayList<>();
+
+        // 1. 通知栏上的“接听”按钮：不需要通话权限，成功率最高
+        if (CallNotificationListener.isEnabled(context) && CallNotificationListener.acceptCall()) {
+            tried.add("通知栏按钮");
+            if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1500)) {
+                result.onResult(true, "已通过通知栏的接听按钮接听");
                 return true;
             }
-        } catch (SecurityException e) {
-            firstError = e.getMessage();
-            Log.w(TAG, "acceptRingingCall denied: " + firstError);
-        } catch (Exception e) {
-            firstError = e.getMessage();
-            Log.w(TAG, "acceptRingingCall failed", e);
+            Log.w(TAG, "notification answer action did not take effect");
         }
 
-        // 部分定制系统只暴露旧的 ITelephony 接口
+        // 2. 系统公开接口
+        tried.add("系统接口");
+        try {
+            TelecomManager telecom = (TelecomManager) context.getSystemService(Context.TELECOM_SERVICE);
+            if (telecom != null) telecom.acceptRingingCall();
+        } catch (Exception e) {
+            Log.w(TAG, "acceptRingingCall failed", e);
+        }
+        if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1500)) {
+            result.onResult(true, "已通过系统接口接听");
+            return true;
+        }
+
+        // 3. 旧版 ITelephony 接口
         if (invokeITelephony(context, "answerRingingCall")) {
-            result.onResult(true, "已通过兼容方式接听");
-            return true;
+            tried.add("兼容接口");
+            if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1000)) {
+                result.onResult(true, "已通过兼容方式接听");
+                return true;
+            }
         }
-        // 来电通知上的“接听”按钮
-        if (CallNotificationListener.acceptCall()) {
-            result.onResult(true, "已通过通知栏按钮接听");
-            return true;
-        }
-        // 最后让无障碍服务去点系统通话界面上的接听按钮
+
+        // 4. 无障碍服务点击系统的接听按钮
         if (CallAccessibilityService.clickAnswer()) {
-            result.onResult(true, "已通过无障碍服务接听");
-            return true;
+            tried.add("无障碍点击");
+            if (waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1500)) {
+                result.onResult(true, "已通过无障碍服务接听");
+                return true;
+            }
         }
-        result.onResult(false, "接听失败" + (firstError == null ? "" : "（" + firstError + "）")
-                + "，请开启“通知使用权”或无障碍辅助功能");
+
+        result.onResult(false, "接听没有被系统接受（已尝试: " + join(tried)
+                + "）。请在应用里开启“通知使用权”或无障碍服务，或手动接听");
         return false;
     }
 
     /** 挂断当前通话或拒接来电。 */
     static boolean endCall(Context context, Result result) {
+        if (!hasPermission(context, Manifest.permission.ANSWER_PHONE_CALLS)) {
+            result.onResult(false, "缺少“接听电话”权限，请在应用里授予");
+            return false;
+        }
+        List<String> tried = new ArrayList<>();
+
+        if (CallNotificationListener.isEnabled(context) && CallNotificationListener.declineCall()) {
+            tried.add("通知栏按钮");
+            if (waitForState(context, TelephonyManager.CALL_STATE_IDLE, 1500)) {
+                result.onResult(true, "已通过通知栏按钮挂断");
+                return true;
+            }
+        }
+
+        tried.add("系统接口");
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             try {
                 TelecomManager telecom = (TelecomManager) context.getSystemService(Context.TELECOM_SERVICE);
-                if (telecom != null && telecom.endCall()) {
-                    result.onResult(true, "已挂断");
-                    return true;
-                }
-            } catch (SecurityException e) {
-                Log.w(TAG, "endCall not permitted: " + e.getMessage());
+                if (telecom != null) telecom.endCall();
             } catch (Exception e) {
                 Log.w(TAG, "endCall failed", e);
+            }
+            if (waitForState(context, TelephonyManager.CALL_STATE_IDLE, 1200)) {
+                result.onResult(true, "已挂断");
+                return true;
             }
         }
 
         if (invokeITelephony(context, "endCall")) {
-            result.onResult(true, "已通过兼容方式挂断");
-            return true;
-        }
-
-        if (CallNotificationListener.declineCall()) {
-            result.onResult(true, "已通过通知栏按钮挂断");
-            return true;
+            tried.add("兼容接口");
+            if (waitForState(context, TelephonyManager.CALL_STATE_IDLE, 1000)) {
+                result.onResult(true, "已通过兼容方式挂断");
+                return true;
+            }
         }
 
         // 最后兜底：让无障碍服务去点系统通话界面上的挂断按钮
         if (CallAccessibilityService.clickHangUp()) {
-            result.onResult(true, "已通过无障碍服务挂断");
-            return true;
+            tried.add("无障碍点击");
+            if (waitForState(context, TelephonyManager.CALL_STATE_IDLE, 1500)) {
+                result.onResult(true, "已通过无障碍服务挂断");
+                return true;
+            }
         }
 
-        result.onResult(false, "挂断失败：系统不允许第三方应用挂断，"
-                + "请开启无障碍辅助功能，或使用通知栏上的挂断按钮");
+        result.onResult(false, "挂断没有被系统接受（已尝试: " + join(tried)
+                + "）。请开启“通知使用权”或无障碍辅助功能");
         return false;
+    }
+
+    /** 轮询通话状态，直到变成期望值或超时。 */
+    private static boolean waitForState(Context context, int expected, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            int state = currentCallState(context);
+            if (state == expected) return true;
+            if (state == TelephonyManager.CALL_STATE_IDLE
+                    && expected == TelephonyManager.CALL_STATE_OFFHOOK) {
+                return false;
+            }
+            try {
+                Thread.sleep(120L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return currentCallState(context) == expected;
+    }
+
+    private static int currentCallState(Context context) {
+        try {
+            TelephonyManager telephony = (TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
+            if (telephony != null) return telephony.getCallState();
+        } catch (Exception e) {
+            Log.w(TAG, "getCallState failed", e);
+        }
+        return TelephonyManager.CALL_STATE_IDLE;
+    }
+
+    private static String join(List<String> items) {
+        StringBuilder sb = new StringBuilder();
+        for (String item : items) {
+            if (sb.length() > 0) sb.append("、");
+            sb.append(item);
+        }
+        return sb.toString();
     }
 
     /** 通过反射调用 ITelephony，仅作兼容手段，失败返回 false。 */

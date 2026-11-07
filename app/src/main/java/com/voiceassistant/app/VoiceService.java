@@ -152,6 +152,10 @@ public class VoiceService extends Service {
     private volatile long lastHangupAt = 0L;
     /** 收到接听/挂断指令时置位，用来立刻掐断正在播报的语音。 */
     private volatile boolean abortSpeech = false;
+    /** 正在执行接听/挂断，期间暂停重复播报。 */
+    private volatile boolean answering = false;
+    /** 同进程内的活动实例，界面用它判断服务是否真的在运行。 */
+    private static volatile VoiceService instance;
     /** 当前正在播报的文本，用来过滤“麦克风把自己的声音听回去”的假指令。 */
     private volatile String currentSpeechText = "";
     /** TTS 与识别共用，保证同一时刻只有一句话在播。 */
@@ -189,6 +193,7 @@ public class VoiceService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        instance = this;
         handler = new Handler(Looper.getMainLooper());
         audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
         createNotificationChannel();
@@ -1269,6 +1274,11 @@ public class VoiceService extends Service {
         @Override
         public void run() {
             if (destroyed) return;
+            if (answering) {
+                // 正在接听，等结果出来再决定要不要继续播报
+                handler.postDelayed(this, 800L);
+                return;
+            }
             if (!isPhoneStillRinging()) {
                 onRingingGone();
                 return;
@@ -1309,7 +1319,8 @@ public class VoiceService extends Service {
             contactLookupDone = true;
             callerName = PhoneCallHelper.lookupContactName(this, callerNumber);
             if (callerName != null) {
-                broadcastDebug("[来电] 匹配到联系人: " + callerName);
+                broadcastDebug("[来电] 匹配到联系人: " + callerName
+                        + (PhoneCallHelper.lastSource.isEmpty() ? "" : "（来源: " + PhoneCallHelper.lastSource + "）"));
             } else if (PhoneCallHelper.hasPermission(this, Manifest.permission.READ_CONTACTS)) {
                 broadcastDebug("[来电] 通讯录里没有该号码，按陌生号码处理（"
                         + ContactsIndex.diagnose(this, callerNumber) + "）");
@@ -1667,8 +1678,18 @@ public class VoiceService extends Service {
             return;
         }
         stopRingAnnouncements();
+        answering = true;
         broadcastDebug("[来电] 执行接听...");
-        PhoneCallHelper.answerCall(this, (success, message) -> broadcastDebug("[来电] " + message));
+        new Thread(() -> {
+            try {
+                PhoneCallHelper.answerCall(this, (success, message) -> {
+                    broadcastDebug("[来电] " + message);
+                    if (!success) speak("无法接听，请手动接听");
+                });
+            } finally {
+                answering = false;
+            }
+        }, "answer-call").start();
     }
 
     private void hangUpCall() {
@@ -1677,8 +1698,18 @@ public class VoiceService extends Service {
             return;
         }
         stopRingAnnouncements();
+        answering = true;
         broadcastDebug("[来电] 执行挂断...");
-        PhoneCallHelper.endCall(this, (success, message) -> broadcastDebug("[来电] " + message));
+        new Thread(() -> {
+            try {
+                PhoneCallHelper.endCall(this, (success, message) -> {
+                    broadcastDebug("[来电] " + message);
+                    if (!success) speak("无法挂断，请手动挂断");
+                });
+            } finally {
+                answering = false;
+            }
+        }, "hangup-call").start();
     }
 
     private void notifyCallState(String state, String text) {
@@ -1879,12 +1910,21 @@ public class VoiceService extends Service {
         releaseWakeLock();
         handler.removeCallbacksAndMessages(null);
 
+        if (instance == this) instance = null;
         ServiceState.save(this, false, STATUS_STOPPED, "", "");
+        Intent stopped = new Intent(ACTION_STATUS);
+        stopped.putExtra(EXTRA_STATUS, STATUS_STOPPED);
+        LocalBroadcastManager.getInstance(this).sendBroadcast(stopped);
         super.onDestroy();
     }
 
     @Override
     public IBinder onBind(Intent intent) { return new android.os.Binder(); }
+
+    /** 服务实例是否真的存在于当前进程里。 */
+    static boolean isAlive() {
+        return instance != null;
+    }
 
     private void sleepQuietly(long millis) {
         try {

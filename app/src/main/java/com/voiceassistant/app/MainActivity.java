@@ -6,14 +6,12 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.content.ServiceConnection;
 import android.app.role.RoleManager;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.IBinder;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.view.View;
@@ -54,32 +52,16 @@ public class MainActivity extends AppCompatActivity {
     private CheckBox cbAnnounce;
 
     private boolean serviceRunning = false;
-    private boolean bound = false;
     private final StringBuilder debugLog = new StringBuilder();
     private final SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm:ss", Locale.getDefault());
-
-    private final ServiceConnection serviceConnection = new ServiceConnection() {
-        @Override
-        public void onServiceConnected(ComponentName name, IBinder binder) {
-            serviceRunning = true;
-            refreshStatusText();
-            LocalBroadcastManager.getInstance(MainActivity.this)
-                    .sendBroadcast(new Intent(VoiceService.ACTION_REQUEST_STATUS));
-        }
-
-        @Override
-        public void onServiceDisconnected(ComponentName name) {
-            serviceRunning = false;
-            applyStatus(VoiceService.STATUS_STOPPED, "", "");
-        }
-    };
 
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            // 能收到服务的广播，说明服务一定还活着
-            serviceRunning = true;
-            applyStatus(intent.getStringExtra(VoiceService.EXTRA_STATUS),
+            String status = intent.getStringExtra(VoiceService.EXTRA_STATUS);
+            // 能收到服务的广播说明服务还在；收到“已停止”则说明它主动退出了
+            serviceRunning = !VoiceService.STATUS_STOPPED.equals(status);
+            applyStatus(status,
                     intent.getStringExtra(VoiceService.EXTRA_ERROR),
                     intent.getStringExtra(VoiceService.EXTRA_DETAIL));
         }
@@ -221,14 +203,6 @@ public class MainActivity extends AppCompatActivity {
         manager.unregisterReceiver(statusReceiver);
         manager.unregisterReceiver(debugReceiver);
         manager.unregisterReceiver(callReceiver);
-        if (bound) {
-            try {
-                unbindService(serviceConnection);
-            } catch (Exception ignored) {
-                // 已经解绑
-            }
-            bound = false;
-        }
     }
 
     // ========== 配置 ==========
@@ -387,7 +361,12 @@ public class MainActivity extends AppCompatActivity {
                 result = "没有通讯录权限，请先点上面的“授予/检查权限”";
             } else {
                 String name = PhoneCallHelper.lookupContactName(this, number);
-                result = name != null ? "匹配到联系人：" + name : "通讯录里没有这个号码";
+                ContactsIndex.warmUp(this);
+                if (name != null) {
+                    result = "匹配到联系人：" + name + "\n" + ContactsIndex.describe(this);
+                } else {
+                    result = "没有匹配到联系人\n" + ContactsIndex.diagnose(this, number);
+                }
             }
             final String message = result;
             runOnUiThread(() -> {
@@ -446,23 +425,18 @@ public class MainActivity extends AppCompatActivity {
 
     // ========== 服务 ==========
 
+    /**
+     * 服务与界面在同一个进程里，直接看静态实例最准。
+     * 之前用 bindService() 判断，系统会顺手把服务创建出来，
+     * 结果一进应用就变成“运行中”，按钮和实际状态对不上。
+     */
     private void refreshServiceState() {
-        boolean alive;
-        try {
-            alive = bindService(new Intent(this, VoiceService.class), serviceConnection, 0);
-        } catch (Exception e) {
-            alive = false;
-        }
-
-        if (alive) {
-            bound = true;
-            serviceRunning = true;
+        serviceRunning = VoiceService.isAlive();
+        if (serviceRunning) {
             refreshStatusText();
             LocalBroadcastManager.getInstance(this)
                     .sendBroadcast(new Intent(VoiceService.ACTION_REQUEST_STATUS));
         } else {
-            bound = false;
-            serviceRunning = false;
             applyStatus(VoiceService.STATUS_STOPPED, "", "");
         }
     }
