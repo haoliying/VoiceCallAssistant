@@ -160,6 +160,13 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        findViewById(R.id.btnContactTest).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                testContactLookup();
+            }
+        });
+
         findViewById(R.id.btnCallScreening).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -304,6 +311,31 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) {
             appendDebug("无法打开无障碍设置: " + e.getMessage());
         }
+    }
+
+    /** 输入一个号码，看看通讯录能不能匹配到人，用来排查“来电不报姓名”。 */
+    private void testContactLookup() {
+        final String number = ((EditText) findViewById(R.id.etContactTest))
+                .getText().toString().trim();
+        if (number.isEmpty()) {
+            Toast.makeText(this, "先输入一个号码", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        new Thread(() -> {
+            String result;
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                result = "没有通讯录权限，请先点上面的“授予/检查权限”";
+            } else {
+                String name = PhoneCallHelper.lookupContactName(this, number);
+                result = name != null ? "匹配到联系人：" + name : "通讯录里没有这个号码";
+            }
+            final String message = result;
+            runOnUiThread(() -> {
+                tvSettingsHint.setText(message);
+                Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+            });
+        }).start();
     }
 
     /** 申请“来电筛选”角色：Android 10+ 响铃前就能拿到号码。 */

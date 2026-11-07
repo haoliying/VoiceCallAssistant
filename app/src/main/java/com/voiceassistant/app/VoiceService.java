@@ -100,8 +100,10 @@ public class VoiceService extends Service {
     /** 只解压了一半的 onnx 文件不可能这么大（完整的 theresa.onnx 约 117MB），用来判断模型是否完整。 */
     private static final long MIN_MODEL_FILE_SIZE = 100L * 1024 * 1024;
     private static final long HEARTBEAT_INTERVAL_MS = 10000L;
-    /** 响铃期间每隔这么久重复播报一次来电信息。 */
-    private static final long RING_REPEAT_INTERVAL_MS = 6000L;
+    /** 一轮播报结束到下一轮开始之间的静默间隔，留给用户下指令。 */
+    private static final long RING_GAP_MS = 3000L;
+    /** 兜底上限，防止状态判断失灵时无限播报。 */
+    private static final int MAX_RING_ROUNDS = 30;
 
     /** 进程级锁：防止多个初始化线程同时读写模型目录。 */
     private static final Object MODEL_LOCK = new Object();
@@ -136,11 +138,14 @@ public class VoiceService extends Service {
     private volatile int callState = TelephonyManager.CALL_STATE_IDLE;
     private volatile String callerNumber = "";
     private volatile String callerName = null;
+    private volatile boolean contactLookupDone = false;
     private volatile int ringRound = 0;
     private volatile boolean speaking = false;
     private volatile long lastCommandAt = 0L;
     /** TTS 与识别共用，保证同一时刻只有一句话在播。 */
     private final Object ttsLock = new Object();
+    /** 当前正在播放的音轨，挂断时可以直接掐掉。 */
+    private volatile AudioTrack activeTrack;
 
     private final Runnable heartbeatRunnable = new Runnable() {
         @Override
@@ -825,19 +830,36 @@ public class VoiceService extends Service {
                 AudioManager.AUDIO_SESSION_ID_GENERATE
         );
 
+        activeTrack = audioTrack;
         requestAudioFocus();
-        audioTrack.play();
-        audioTrack.write(audioBytes, 0, audioBytes.length);
-
         try {
-            Thread.sleep((long) (samples.length * 1000.0 / sampleRate) + 200);
-        } catch (InterruptedException e) {
-            // ignore
+            audioTrack.play();
+            audioTrack.write(audioBytes, 0, audioBytes.length);
+            try {
+                Thread.sleep((long) (samples.length * 1000.0 / sampleRate) + 200);
+            } catch (InterruptedException e) {
+                // ignore
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "playAudio interrupted", e);
+        } finally {
+            activeTrack = null;
+            try { audioTrack.stop(); } catch (Exception ignored) { }
+            try { audioTrack.release(); } catch (Exception ignored) { }
+            abandonAudioFocus();
         }
+    }
 
-        audioTrack.stop();
-        audioTrack.release();
-        abandonAudioFocus();
+    /** 立即停止正在播放的播报（例如来电已经挂断）。 */
+    private void stopPlayback() {
+        AudioTrack track = activeTrack;
+        if (track == null) return;
+        try {
+            track.pause();
+            track.flush();
+        } catch (Exception e) {
+            Log.w(TAG, "stopPlayback failed", e);
+        }
     }
 
     // ========== Audio Focus ==========
@@ -1022,33 +1044,57 @@ public class VoiceService extends Service {
 
     /** 统一的播报入口：同一时刻只播一句，播报期间不响应识别结果。 */
     private void speak(String text) {
-        if (!ttsReady || tts == null) {
+        speak(text, false, null);
+    }
+
+    /**
+     * @param onlyWhileRinging 只在这通电话仍处于响铃状态时播报，挂断后不再念号码
+     * @param onDone           播完（或被跳过）后的回调，用来安排下一轮播报
+     */
+    private void speak(String text, boolean onlyWhileRinging, Runnable onDone) {
+        final OfflineTts currentTts = tts;
+        if (!ttsReady || currentTts == null) {
             broadcastDebug("[tts-error] TTS 未就绪，无法播报: " + text);
+            if (onDone != null) onDone.run();
+            return;
+        }
+        if (onlyWhileRinging && !isPhoneStillRinging()) {
+            if (onDone != null) onDone.run();
             return;
         }
         broadcastDebug("[tts] 播报: " + text);
 
         new Thread(() -> {
+            boolean skipped = false;
             synchronized (ttsLock) {
-                speaking = true;
-                try {
-                    GeneratedAudio audio = tts.generate(text);
-                    if (audio != null && audio.getSamples() != null && audio.getSamples().length > 0) {
-                        playAudio(audio.getSamples(), audio.getSampleRate());
-                        broadcastDebug("[tts-ok] 播报完成");
-                    } else {
-                        broadcastDebug("[tts-error] 生成音频失败");
+                // 排队等待期间电话可能已经结束，这里再确认一次
+                if (onlyWhileRinging && !isPhoneStillRinging()) {
+                    skipped = true;
+                } else {
+                    speaking = true;
+                    try {
+                        GeneratedAudio audio = currentTts.generate(text);
+                        if (audio != null && audio.getSamples() != null && audio.getSamples().length > 0) {
+                            playAudio(audio.getSamples(), audio.getSampleRate());
+                            broadcastDebug("[tts-ok] 播报完成");
+                        } else {
+                            broadcastDebug("[tts-error] 生成音频失败");
+                        }
+                    } catch (Exception e) {
+                        broadcastDebug("[tts-error] " + e.getMessage());
+                        Log.e(TAG, "TTS error", e);
+                    } finally {
+                        // 留一点尾巴，避免喇叭余音被麦克风当成指令
+                        sleepQuietly(500);
+                        speaking = false;
+                        lastCommandAt = SystemClock.elapsedRealtime();
                     }
-                } catch (Exception e) {
-                    broadcastDebug("[tts-error] " + e.getMessage());
-                    Log.e(TAG, "TTS error", e);
-                } finally {
-                    // 留一点尾巴，避免喇叭余音被麦克风当成指令
-                    sleepQuietly(500);
-                    speaking = false;
-                    lastCommandAt = SystemClock.elapsedRealtime();
                 }
             }
+            if (skipped) {
+                broadcastDebug("[tts] 已挂断，跳过本轮播报");
+            }
+            if (onDone != null) onDone.run();
         }).start();
     }
 
@@ -1117,6 +1163,7 @@ public class VoiceService extends Service {
                 if (screened != null) callerNumber = screened;
             }
             callerName = null;
+            contactLookupDone = false;
             logCallPermissions();
             startRingAnnouncements();
         } else if (state == TelephonyManager.CALL_STATE_OFFHOOK) {
@@ -1130,23 +1177,33 @@ public class VoiceService extends Service {
             stopRingAnnouncements();
             callerNumber = "";
             callerName = null;
+            contactLookupDone = false;
             CallNotificationListener.clear();
             IncomingCallScreeningService.clear();
+            stopPlayback();
             broadcastDebug("[来电] 通话结束");
             notifyCallState(CALL_STATE_IDLE, "空闲");
             updateNotification(currentStatus);
         }
     }
 
-    /** 响铃期间反复播报，直到接通、拒接或对方挂断。 */
+    /** 响铃期间反复播报：每轮播完再排下一轮，避免播报任务越积越多。 */
     private final Runnable ringAnnouncer = new Runnable() {
         @Override
         public void run() {
-            if (destroyed || callState != TelephonyManager.CALL_STATE_RINGING) return;
+            if (destroyed) return;
+            if (!isPhoneStillRinging()) {
+                onRingingGone();
+                return;
+            }
+            if (ringRound >= MAX_RING_ROUNDS) {
+                broadcastDebug("[来电] 已达到最大播报次数，停止播报");
+                stopRingAnnouncements();
+                return;
+            }
             ringRound++;
             final int round = ringRound;
             new Thread(() -> announceRingRound(round)).start();
-            handler.postDelayed(this, RING_REPEAT_INTERVAL_MS);
         }
     };
 
@@ -1160,14 +1217,26 @@ public class VoiceService extends Service {
         handler.removeCallbacks(ringAnnouncer);
     }
 
-    /** 每一轮都重新确认一次号码和姓名，通知栏后补上的信息下一轮就能用上。 */
+    /** 每一轮都重新确认号码和姓名，通知栏后补上的信息下一轮就能用上。 */
     private void announceRingRound(int round) {
         String number = resolveCallerNumber(round == 1);
         if (!number.isEmpty() && !number.equals(callerNumber)) {
+            // 号码变了（例如通知栏后补上来），需要重新查一次联系人
             callerNumber = number;
-            callerName = PhoneCallHelper.lookupContactName(this, number);
+            callerName = null;
+            contactLookupDone = false;
+        }
+        // 有号码但还没查过就查一次：之前这里只在号码变化时才查，
+        // 恰好漏掉了"回调里直接拿到号码"这种最常见的情况
+        if (callerName == null && !callerNumber.isEmpty() && !contactLookupDone) {
+            contactLookupDone = true;
+            callerName = PhoneCallHelper.lookupContactName(this, callerNumber);
             if (callerName != null) {
                 broadcastDebug("[来电] 匹配到联系人: " + callerName);
+            } else if (PhoneCallHelper.hasPermission(this, Manifest.permission.READ_CONTACTS)) {
+                broadcastDebug("[来电] 通讯录里没有该号码，按陌生号码处理");
+            } else {
+                broadcastDebug("[来电] 通讯录未授权，无法匹配姓名，请在应用里授予联系人权限");
             }
         }
         if (callerName == null && callerNumber.isEmpty()) {
@@ -1175,7 +1244,11 @@ public class VoiceService extends Service {
             if (hint != null) callerName = hint;
         }
 
-        if (destroyed || callState != TelephonyManager.CALL_STATE_RINGING) return;
+        if (destroyed) return;
+        if (!isPhoneStillRinging()) {
+            onRingingGone();
+            return;
+        }
 
         String text = buildCallerText();
         broadcastDebug("[来电] 第" + round + "次播报: " + text + "（号码 "
@@ -1184,11 +1257,76 @@ public class VoiceService extends Service {
         updateNotification(currentStatus);
 
         if (AppSettings.isAnnounceCaller(this)) {
-            speak(text);
+            Runnable nextRound = () -> {
+                if (destroyed) return;
+                if (isPhoneStillRinging()) {
+                    handler.postDelayed(ringAnnouncer, RING_GAP_MS);
+                } else {
+                    onRingingGone();
+                }
+            };
+            if (callerName != null && !callerName.isEmpty()) {
+                speak(callerName + "来电话", true, nextRound);
+            } else if (!callerNumber.isEmpty()) {
+                speakNumber(callerNumber, true, nextRound);
+            } else {
+                speak("有来电", true, nextRound);
+            }
+        } else {
+            stopRingAnnouncements();
         }
     }
 
-    /** 号码优先用系统回调里的；为空时再去通知栏里等一会儿。 */
+    /** 响铃已经结束（对方挂断或超时），同步状态并立即收声。 */
+    private void onRingingGone() {
+        stopRingAnnouncements();
+        if (callState != TelephonyManager.CALL_STATE_RINGING) return;
+
+        int actual = queryCallState();
+        if (actual == TelephonyManager.CALL_STATE_OFFHOOK) {
+            callState = TelephonyManager.CALL_STATE_OFFHOOK;
+            notifyCallState(CALL_STATE_OFFHOOK, "通话中");
+        } else {
+            callState = TelephonyManager.CALL_STATE_IDLE;
+            callerNumber = "";
+            callerName = null;
+            contactLookupDone = false;
+            CallNotificationListener.clear();
+            IncomingCallScreeningService.clear();
+            broadcastDebug("[来电] 检测到响铃已结束，停止播报");
+            notifyCallState(CALL_STATE_IDLE, "空闲");
+            stopPlayback();
+        }
+        updateNotification(currentStatus);
+    }
+
+    /** 直接问系统当前通话状态，不依赖回调，防止漏掉 STATE_IDLE。 */
+    private int queryCallState() {
+        try {
+            TelephonyManager tm = (TelephonyManager) getSystemService(TELEPHONY_SERVICE);
+            if (tm != null && PhoneCallHelper.canReadPhoneState(this)) {
+                return tm.getCallState();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "getCallState failed", e);
+        }
+        return callState;
+    }
+
+    /** 是否仍在响铃；系统状态拿不到时退回回调里记录的状态。 */
+    private boolean isPhoneStillRinging() {
+        try {
+            TelephonyManager tm = (TelephonyManager) getSystemService(TELEPHONY_SERVICE);
+            if (tm != null && PhoneCallHelper.canReadPhoneState(this)) {
+                return tm.getCallState() == TelephonyManager.CALL_STATE_RINGING;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "getCallState failed", e);
+        }
+        return callState == TelephonyManager.CALL_STATE_RINGING;
+    }
+
+    /** 号码优先用系统回调里的；为空时依次试来电筛选、通知栏。 */
     private String resolveCallerNumber(boolean waitForNotification) {
         if (!callerNumber.isEmpty()) return callerNumber;
 
@@ -1209,29 +1347,93 @@ public class VoiceService extends Service {
         return "";
     }
 
-    /** 联系人读名字，陌生号码逐位读数字。 */
+    /** 界面上显示 / 通知里用的文案（数字保持原样，便于阅读）。 */
     private String buildCallerText() {
         if (callerName != null && !callerName.isEmpty()) {
             return callerName + "来电话";
         }
         if (!callerNumber.isEmpty()) {
-            String spoken = digitsToSpeech(callerNumber);
-            if (!spoken.isEmpty()) return spoken + "来电话";
+            return callerNumber + "来电话";
         }
         return "有来电";
     }
 
-    /** 逐位读号码，避免 TTS 把 13800138000 念成“十三亿多”。 */
-    private static String digitsToSpeech(String number) {
-        String digits = number.replaceAll("[^0-9]", "");
-        if (digits.isEmpty()) return "";
-        if (digits.length() > 15) digits = digits.substring(0, 15);
-        String[] table = {"零", "一", "二", "三", "四", "五", "六", "七", "八", "九"};
-        StringBuilder sb = new StringBuilder(digits.length());
-        for (int i = 0; i < digits.length(); i++) {
-            sb.append(table[digits.charAt(i) - '0']);
+    /**
+     * 号码逐个数字单独合成，中间插入 250ms 静音再拼起来播放。
+     * 直接在文本里塞标点依赖前端是否支持，合成出来可能还是一串连读，
+     * 所以这里用真实的静音来保证每个数字之间都有停顿。
+     */
+    private void speakNumber(String number, boolean onlyWhileRinging, Runnable onDone) {
+        final OfflineTts currentTts = tts;
+        if (!ttsReady || currentTts == null) {
+            broadcastDebug("[tts-error] TTS 未就绪，无法播报号码");
+            if (onDone != null) onDone.run();
+            return;
         }
-        return sb.toString();
+        if (onlyWhileRinging && !isPhoneStillRinging()) {
+            if (onDone != null) onDone.run();
+            return;
+        }
+        final String digits = number.replaceAll("[^0-9]", "");
+        if (digits.isEmpty()) {
+            speak("有来电", onlyWhileRinging, onDone);
+            return;
+        }
+        broadcastDebug("[tts] 逐位播报号码: " + PhoneCallHelper.maskNumber(digits));
+
+        new Thread(() -> {
+            boolean skipped = false;
+            synchronized (ttsLock) {
+                if (onlyWhileRinging && !isPhoneStillRinging()) {
+                    skipped = true;
+                } else {
+                    speaking = true;
+                    try {
+                        String[] table = {"零", "一", "二", "三", "四", "五", "六", "七", "八", "九"};
+                        java.util.List<float[]> parts = new java.util.ArrayList<>();
+                        int rate = ttsSampleRate;
+                        for (int i = 0; i < digits.length() && !destroyed; i++) {
+                            GeneratedAudio one = currentTts.generate(
+                                    table[digits.charAt(i) - '0'], 0, 0.85f);
+                            if (one != null && one.getSamples() != null) {
+                                rate = one.getSampleRate();
+                                parts.add(one.getSamples());
+                            }
+                            parts.add(new float[Math.max(1, rate / 4)]); // 250ms 停顿
+                        }
+                        GeneratedAudio tail = currentTts.generate("来电话", 0, 1.0f);
+                        if (tail != null && tail.getSamples() != null) {
+                            parts.add(tail.getSamples());
+                        }
+                        if (!parts.isEmpty() && !destroyed) {
+                            playAudio(concat(parts), rate);
+                            broadcastDebug("[tts-ok] 号码播报完成");
+                        }
+                    } catch (Exception e) {
+                        broadcastDebug("[tts-error] " + e.getMessage());
+                        Log.e(TAG, "TTS number error", e);
+                    } finally {
+                        sleepQuietly(400);
+                        speaking = false;
+                        lastCommandAt = SystemClock.elapsedRealtime();
+                    }
+                }
+            }
+            if (skipped) broadcastDebug("[tts] 已挂断，跳过本轮播报");
+            if (onDone != null) onDone.run();
+        }).start();
+    }
+
+    private static float[] concat(java.util.List<float[]> parts) {
+        int total = 0;
+        for (float[] part : parts) total += part.length;
+        float[] merged = new float[total];
+        int offset = 0;
+        for (float[] part : parts) {
+            System.arraycopy(part, 0, merged, offset, part.length);
+            offset += part.length;
+        }
+        return merged;
     }
 
     private void logCallPermissions() {
