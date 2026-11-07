@@ -3,10 +3,7 @@ package com.voiceassistant.app;
 import android.Manifest;
 import android.content.Context;
 import android.content.pm.PackageManager;
-import android.net.Uri;
 import android.os.Build;
-import android.provider.ContactsContract;
-import android.provider.ContactsContract.CommonDataKinds;
 import android.telecom.TelecomManager;
 import android.telephony.TelephonyManager;
 import android.util.Log;
@@ -16,18 +13,16 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 来电相关能力：号码 -> 联系人名字、接听、挂断。
+ * 来电相关能力：接听、挂断。
  *
- * 接听用 TelephonyManager/TelecomManager 的公开 API；挂断没有公开 API，
- * 这里按“TelecomManager.endCall -> ITelephony.endCall -> 无障碍点击挂断按钮”
- * 三种方式依次尝试，并把每一步的结果交给调用方展示。
+ * 来电姓名和号码都来自来电通知（{@link CallNotificationListener}），不再读通讯录。
+ * 接听优先点通知栏的“接听”按钮，再用 TelephonyManager/TelecomManager 的公开 API；
+ * 挂断没有公开 API，按“通知栏按钮 -> TelecomManager.endCall -> ITelephony.endCall
+ * -> 无障碍点击挂断按钮”依次尝试，每一步都用通话状态验证。
  */
 final class PhoneCallHelper {
 
     private static final String TAG = "PhoneCallHelper";
-
-    /** 上一次查询命中的来源，方便日志定位。 */
-    static volatile String lastSource = "";
 
     interface Result {
         void onResult(boolean success, String message);
@@ -43,138 +38,6 @@ final class PhoneCallHelper {
         return hasPermission(context, Manifest.permission.READ_PHONE_STATE);
     }
 
-    /** 号码能查到联系人姓名就返回姓名，查不到返回 null（陌生号码）。 */
-    static String lookupContactName(Context context, String number) {
-        lastSource = "";
-        if (number == null || number.trim().isEmpty()) return null;
-        if (!hasPermission(context, Manifest.permission.READ_CONTACTS)) return null;
-
-        // 同一个号码可能存成 +8613800138000 / 13800138000，逐个候选值试一遍
-        java.util.List<String> candidates = candidates(number);
-        for (String candidate : candidates) {
-            String name = queryName(context, candidate);
-            if (name != null) {
-                lastSource = "系统 PhoneLookup";
-                return name;
-            }
-        }
-        // 本地索引：号码归一化后按国内/国际写法整号比对，不做位数截断
-        String indexed = ContactsIndex.lookup(context, number);
-        if (indexed != null) {
-            lastSource = "本地通讯录索引";
-            return indexed;
-        }
-
-        // 通话记录里系统自己缓存过姓名，顺带抄一份
-        String cached = queryCallLogName(context, candidates);
-        if (cached != null) {
-            lastSource = "通话记录缓存";
-            return cached;
-        }
-
-        // 最后的兜底：按号码后 8 位模糊找一次，只用于“通讯录只存了局号”的固话
-        String bySuffix = queryNameBySuffix(context, candidates);
-        if (bySuffix != null) lastSource = "号码后 8 位";
-        return bySuffix;
-    }
-
-    /** 通话记录里系统解析出的联系人姓名（需要“通话记录”权限）。 */
-    private static String queryCallLogName(Context context, java.util.List<String> candidates) {
-        if (!hasPermission(context, Manifest.permission.READ_CALL_LOG)) return null;
-        for (String candidate : candidates) {
-            if (candidate.length() < 7) continue;
-            String suffix = "%" + candidate.substring(candidate.length() - 7);
-            android.database.Cursor cursor = null;
-            try {
-                cursor = context.getContentResolver().query(
-                        android.provider.CallLog.Calls.CONTENT_URI,
-                        new String[]{android.provider.CallLog.Calls.CACHED_NAME},
-                        android.provider.CallLog.Calls.NUMBER + " LIKE ?",
-                        new String[]{suffix},
-                        android.provider.CallLog.Calls.DATE + " DESC");
-                if (cursor != null && cursor.moveToFirst()) {
-                    String name = cursor.getString(0);
-                    if (name != null && !name.trim().isEmpty()
-                            && !ContactsIndex.normalize(name).equals(candidate)) {
-                        return name.trim();
-                    }
-                }
-            } catch (Exception e) {
-                Log.w(TAG, "queryCallLogName failed", e);
-            } finally {
-                if (cursor != null) {
-                    try { cursor.close(); } catch (Exception ignored) { }
-                }
-            }
-        }
-        return null;
-    }
-
-    private static String queryNameBySuffix(Context context, java.util.List<String> candidates) {
-        for (String candidate : candidates) {
-            if (candidate.length() < 8) continue;
-            String suffix = candidate.substring(candidate.length() - 8);
-            android.database.Cursor cursor = null;
-            try {
-                String normalizedColumn = "REPLACE(REPLACE(REPLACE("
-                        + CommonDataKinds.Phone.NUMBER + ",' ',''),'-',''),'+','')";
-                cursor = context.getContentResolver().query(
-                        CommonDataKinds.Phone.CONTENT_URI,
-                        new String[]{CommonDataKinds.Phone.DISPLAY_NAME},
-                        normalizedColumn + " LIKE ?",
-                        new String[]{"%" + suffix},
-                        null);
-                if (cursor != null && cursor.moveToFirst()) {
-                    String name = cursor.getString(0);
-                    if (name != null && !name.trim().isEmpty()) return name.trim();
-                }
-            } catch (Exception e) {
-                Log.w(TAG, "queryNameBySuffix failed", e);
-            } finally {
-                if (cursor != null) {
-                    try { cursor.close(); } catch (Exception ignored) { }
-                }
-            }
-        }
-        return null;
-    }
-
-    private static java.util.List<String> candidates(String number) {
-        java.util.List<String> result = new java.util.ArrayList<>();
-        String digits = number.replaceAll("[^0-9]", "");
-        if (digits.isEmpty()) return result;
-        result.add(digits);
-
-        if (digits.length() > 11) {
-            result.add(digits.substring(digits.length() - 11));
-        }
-        if (digits.startsWith("86") && digits.length() == 13) {
-            result.add(digits.substring(2));
-        }
-        return result;
-    }
-
-    private static String queryName(Context context, String number) {
-        android.database.Cursor cursor = null;
-        try {
-            Uri uri = Uri.withAppendedPath(
-                    ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(number));
-            cursor = context.getContentResolver().query(uri,
-                    new String[]{ContactsContract.PhoneLookup.DISPLAY_NAME}, null, null, null);
-            if (cursor != null && cursor.moveToFirst()) {
-                String name = cursor.getString(0);
-                if (name != null && !name.trim().isEmpty()) return name.trim();
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "queryName failed", e);
-        } finally {
-            if (cursor != null) {
-                try { cursor.close(); } catch (Exception ignored) { }
-            }
-        }
-        return null;
-    }
-
     /**
      * 接听正在响铃的电话。
      *
@@ -182,10 +45,6 @@ final class PhoneCallHelper {
      * 所以每一步都要用 getCallState() 验证，失败再换下一种方式。
      */
     static boolean answerCall(Context context, Result result) {
-        if (!hasPermission(context, Manifest.permission.ANSWER_PHONE_CALLS)) {
-            result.onResult(false, "缺少“接听电话”权限，请在应用里授予");
-            return false;
-        }
         List<String> tried = new ArrayList<>();
 
         // 1. 通知栏上的“接听”按钮：不需要通话权限，成功率最高
@@ -196,6 +55,12 @@ final class PhoneCallHelper {
                 return true;
             }
             Log.w(TAG, "notification answer action did not take effect");
+        }
+
+        if (!hasPermission(context, Manifest.permission.ANSWER_PHONE_CALLS)) {
+            result.onResult(false, "接听没有成功（已尝试: " + join(tried)
+                    + "）。请开启“通知使用权”并授予“接听电话”权限");
+            return false;
         }
 
         // 2. 系统公开接口
@@ -236,10 +101,6 @@ final class PhoneCallHelper {
 
     /** 挂断当前通话或拒接来电。 */
     static boolean endCall(Context context, Result result) {
-        if (!hasPermission(context, Manifest.permission.ANSWER_PHONE_CALLS)) {
-            result.onResult(false, "缺少“接听电话”权限，请在应用里授予");
-            return false;
-        }
         List<String> tried = new ArrayList<>();
 
         if (CallNotificationListener.isEnabled(context) && CallNotificationListener.declineCall()) {
@@ -248,6 +109,12 @@ final class PhoneCallHelper {
                 result.onResult(true, "已通过通知栏按钮挂断");
                 return true;
             }
+        }
+
+        if (!hasPermission(context, Manifest.permission.ANSWER_PHONE_CALLS)) {
+            result.onResult(false, "挂断没有成功（已尝试: " + join(tried)
+                    + "）。请开启“通知使用权”并授予“接听电话”权限");
+            return false;
         }
 
         tried.add("系统接口");

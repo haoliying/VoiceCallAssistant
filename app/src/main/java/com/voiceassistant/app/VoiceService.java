@@ -146,7 +146,6 @@ public class VoiceService extends Service {
     private volatile int callState = TelephonyManager.CALL_STATE_IDLE;
     private volatile String callerNumber = "";
     private volatile String callerName = null;
-    private volatile boolean contactLookupDone = false;
     private volatile int ringRound = 0;
     private volatile boolean speaking = false;
     private volatile long lastCommandAt = 0L;
@@ -262,8 +261,6 @@ public class VoiceService extends Service {
 
                 // 后台预热号码读音，来电时才能立刻播报
                 new Thread(this::buildDigitAudioCache, "tts-digit-cache").start();
-                // 预热通讯录索引，来电时不用现场读联系人
-                new Thread(() -> ContactsIndex.warmUp(this), "contacts-index").start();
 
                 // 3. Init AudioRecord
                 if (!initAudioRecord()) {
@@ -1265,7 +1262,6 @@ public class VoiceService extends Service {
                 if (screened != null) callerNumber = screened;
             }
             callerName = null;
-            contactLookupDone = false;
             answerFailureReported = false;
             answerFailedAt = 0L;
             logCallPermissions();
@@ -1281,7 +1277,6 @@ public class VoiceService extends Service {
             stopRingAnnouncements();
             callerNumber = "";
             callerName = null;
-            contactLookupDone = false;
             CallNotificationListener.clear();
             IncomingCallScreeningService.clear();
             speechEpoch++;
@@ -1331,33 +1326,28 @@ public class VoiceService extends Service {
     private void announceRingRound(int round) {
         String number = resolveCallerNumber(round == 1);
         if (!number.isEmpty() && !number.equals(callerNumber)) {
-            // 号码变了（例如通知栏后补上来），需要重新查一次联系人
+            // 号码变了（例如通知栏后补上来），姓名也要重新取
             callerNumber = number;
             callerName = null;
-            contactLookupDone = false;
         }
-        // 有号码但还没查过就查一次：之前这里只在号码变化时才查，
-        // 恰好漏掉了"回调里直接拿到号码"这种最常见的情况
-        if (callerName == null && !callerNumber.isEmpty() && !contactLookupDone) {
-            contactLookupDone = true;
-            callerName = PhoneCallHelper.lookupContactName(this, callerNumber);
-            if (callerName != null) {
-                broadcastDebug("[来电] 匹配到联系人: " + callerName
-                        + (PhoneCallHelper.lastSource.isEmpty() ? "" : "（来源: " + PhoneCallHelper.lastSource + "）"));
-            } else if (PhoneCallHelper.hasPermission(this, Manifest.permission.READ_CONTACTS)) {
-                broadcastDebug("[来电] 通讯录里没有该号码，按陌生号码处理（"
-                        + ContactsIndex.diagnose(this, callerNumber) + "）");
-            } else {
-                broadcastDebug("[来电] 通讯录未授权，无法匹配姓名，请在应用里授予联系人权限");
-            }
-        }
-        // 系统通讯录看不到时（例如联系人只在 SIM 卡里），通话通知里通常已经有姓名
-        if (callerName == null) {
-            String hint = CallNotificationListener.recentName();
-            if (hint != null) {
-                callerName = hint;
-                broadcastDebug("[来电] 从通话通知里读到姓名: " + hint);
-            }
+        // 姓名只从来电通知里取：第一轮等一小会儿，后面的轮次看一眼就走
+        if (callerName == null && CallNotificationListener.isEnabled(this)) {
+            long deadline = SystemClock.elapsedRealtime() + (round == 1 ? 1200L : 0L);
+            do {
+                String hint = CallNotificationListener.recentName();
+                if (hint != null) {
+                    callerName = hint;
+                    broadcastDebug("[来电] 从通话通知里读到姓名: " + hint);
+                    break;
+                }
+                if (callerNumber.isEmpty()) {
+                    String fromNotification = CallNotificationListener.recentNumber();
+                    if (fromNotification != null) callerNumber = fromNotification;
+                }
+                if (round > 1) break;
+                sleepQuietly(100);
+            } while (!destroyed && SystemClock.elapsedRealtime() < deadline
+                    && callState == TelephonyManager.CALL_STATE_RINGING);
         }
 
         if (destroyed) return;
@@ -1413,7 +1403,6 @@ public class VoiceService extends Service {
             callState = TelephonyManager.CALL_STATE_IDLE;
             callerNumber = "";
             callerName = null;
-            contactLookupDone = false;
             CallNotificationListener.clear();
             IncomingCallScreeningService.clear();
             speechEpoch++;
@@ -1757,13 +1746,12 @@ public class VoiceService extends Service {
     }
 
     private void logCallPermissions() {
-        broadcastDebug("[来电] 权限 联系人=" + granted(Manifest.permission.READ_CONTACTS)
-                + " 通话记录=" + granted(Manifest.permission.READ_CALL_LOG)
+        boolean notif = CallNotificationListener.isEnabled(this);
+        broadcastDebug("[来电] 权限 通话记录=" + granted(Manifest.permission.READ_CALL_LOG)
                 + " 接听=" + granted(Manifest.permission.ANSWER_PHONE_CALLS)
-                + " 来电筛选=" + (IncomingCallScreeningService.isEnabled(this) ? "已开启" : "未开启")
-                + " 通知使用权=" + (CallNotificationListener.isEnabled(this) ? "已开启" : "未开启"));
-        if (PhoneCallHelper.hasPermission(this, Manifest.permission.READ_CONTACTS)) {
-            broadcastDebug("[来电] " + ContactsIndex.describe(this));
+                + " 通知使用权=" + (notif ? "已开启" : "未开启（姓名和接听都要用它）"));
+        if (!notif) {
+            broadcastDebug("[来电] 请在应用里开启“通知使用权”，否则只能念号码、也无法接听");
         }
     }
 

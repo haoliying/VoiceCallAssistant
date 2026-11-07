@@ -160,13 +160,6 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-        findViewById(R.id.btnContactTest).setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                testContactLookup();
-            }
-        });
-
         findViewById(R.id.btnCallScreening).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -182,6 +175,13 @@ public class MainActivity extends AppCompatActivity {
         });
 
         requestAllPermissions();
+
+        // 来电姓名和接听都依赖通知使用权，没有就直接把用户带到授权页
+        if (savedInstanceState == null && !CallNotificationListener.isEnabled(this)) {
+            Toast.makeText(this, "请勾选“语音电话助手”，否则拿不到来电姓名、也无法接听",
+                    Toast.LENGTH_LONG).show();
+            openNotificationListenerSettings();
+        }
     }
 
     @Override
@@ -244,7 +244,6 @@ public class MainActivity extends AppCompatActivity {
         List<String> permissions = new ArrayList<>();
         permissions.add(Manifest.permission.RECORD_AUDIO);
         permissions.add(Manifest.permission.READ_PHONE_STATE);
-        permissions.add(Manifest.permission.READ_CONTACTS);
         permissions.add(Manifest.permission.READ_CALL_LOG);
         permissions.add(Manifest.permission.ANSWER_PHONE_CALLS);
         permissions.add(Manifest.permission.CALL_PHONE);
@@ -282,13 +281,15 @@ public class MainActivity extends AppCompatActivity {
         StringBuilder sb = new StringBuilder();
         sb.append("录音：").append(stateOf(Manifest.permission.RECORD_AUDIO));
         sb.append("  电话状态：").append(stateOf(Manifest.permission.READ_PHONE_STATE));
-        sb.append("\n联系人：").append(stateOf(Manifest.permission.READ_CONTACTS));
-        sb.append("  通话记录：").append(stateOf(Manifest.permission.READ_CALL_LOG));
-        sb.append("\n接听电话：").append(stateOf(Manifest.permission.ANSWER_PHONE_CALLS));
-        sb.append("  拨打电话：").append(stateOf(Manifest.permission.CALL_PHONE));
+        sb.append("\n通话记录：").append(stateOf(Manifest.permission.READ_CALL_LOG));
+        sb.append("  接听电话：").append(stateOf(Manifest.permission.ANSWER_PHONE_CALLS));
+        sb.append("\n拨打电话：").append(stateOf(Manifest.permission.CALL_PHONE));
         sb.append("\n来电筛选：").append(IncomingCallScreeningService.isEnabled(this) ? "已开启" : "未开启");
         sb.append("  通知使用权：").append(CallNotificationListener.isEnabled(this) ? "已开启" : "未开启");
         sb.append("\n无障碍服务：").append(CallAccessibilityService.isEnabledInSettings(this) ? "已开启" : "未开启");
+        if (!CallNotificationListener.isEnabled(this)) {
+            sb.append("\n提示：姓名和接听都靠“通知使用权”，请点下面的按钮开启");
+        }
         tvPermissions.setText(sb.toString());
     }
 
@@ -326,7 +327,6 @@ public class MainActivity extends AppCompatActivity {
         sb.append("=== 语音电话助手 ").append(BuildConfig.VERSION_NAME).append(" ===\n");
         sb.append("录音=").append(stateOf(Manifest.permission.RECORD_AUDIO));
         sb.append(" 电话状态=").append(stateOf(Manifest.permission.READ_PHONE_STATE));
-        sb.append(" 联系人=").append(stateOf(Manifest.permission.READ_CONTACTS));
         sb.append(" 通话记录=").append(stateOf(Manifest.permission.READ_CALL_LOG)).append("\n");
         sb.append("来电筛选=").append(IncomingCallScreeningService.isEnabled(this) ? "已开启" : "未开启");
         sb.append(" 通知使用权=").append(CallNotificationListener.isEnabled(this) ? "已开启" : "未开启");
@@ -344,36 +344,6 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) {
             Toast.makeText(this, "复制失败: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
-    }
-
-    /** 输入一个号码，看看通讯录能不能匹配到人，用来排查“来电不报姓名”。 */
-    private void testContactLookup() {
-        final String number = ((EditText) findViewById(R.id.etContactTest))
-                .getText().toString().trim();
-        if (number.isEmpty()) {
-            Toast.makeText(this, "先输入一个号码", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        new Thread(() -> {
-            String result;
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS)
-                    != PackageManager.PERMISSION_GRANTED) {
-                result = "没有通讯录权限，请先点上面的“授予/检查权限”";
-            } else {
-                String name = PhoneCallHelper.lookupContactName(this, number);
-                ContactsIndex.warmUp(this);
-                if (name != null) {
-                    result = "匹配到联系人：" + name + "\n" + ContactsIndex.describe(this);
-                } else {
-                    result = "没有匹配到联系人\n" + ContactsIndex.diagnose(this, number);
-                }
-            }
-            final String message = result;
-            runOnUiThread(() -> {
-                tvSettingsHint.setText(message);
-                Toast.makeText(this, message, Toast.LENGTH_LONG).show();
-            });
-        }).start();
     }
 
     /** 申请“来电筛选”角色：Android 10+ 响铃前就能拿到号码。 */

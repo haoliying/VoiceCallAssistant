@@ -97,38 +97,8 @@
                 android:id="@+id/btnNotificationAccess"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="开启通知使用权（号码兜底）"
+                android:text="开启通知使用权（来电姓名与接听）"
                 android:layout_marginBottom="16dp" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="测试联系人匹配"
-                android:textSize="13sp"
-                android:textColor="#666666" />
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal"
-                android:gravity="center_vertical"
-                android:layout_marginBottom="16dp">
-
-                <EditText
-                    android:id="@+id/etContactTest"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:inputType="phone"
-                    android:maxLines="1"
-                    android:hint="输入号码，如 13800138000" />
-
-                <Button
-                    android:id="@+id/btnContactTest"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="测试" />
-            </LinearLayout>
 
             <TextView
                 android:layout_width="match_parent"
@@ -191,7 +161,7 @@
                 android:id="@+id/cbAnnounceCaller"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="来电时播报联系人姓名"
+                android:text="来电时播报姓名（来自来电通知）"
                 android:checked="true"
                 android:layout_marginBottom="8dp" />
 

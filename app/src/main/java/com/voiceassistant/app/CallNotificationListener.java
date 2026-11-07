@@ -17,9 +17,10 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * 可选的兜底方案：Android 9 以后，没有通话记录权限时来电号码会是空的，
- * 这里从系统通话通知里把号码（或联系人名字）抓出来备用。
- * 需要用户在“通知使用权”里授权，未授权时整个类不工作，不影响其它功能。
+ * 来电姓名和接听的主要来源：从系统通话通知里取来电人姓名/号码，
+ * 并直接点击通知上的“接听”“挂断”按钮完成操作。
+ * 需要用户在“通知使用权”里授权；未授权时只能念系统回调给出的号码，
+ * 接听则退回系统接口。
  */
 public class CallNotificationListener extends NotificationListenerService {
 
@@ -37,6 +38,13 @@ public class CallNotificationListener extends NotificationListenerService {
 
     private static final String[] ANSWER_KEYWORDS = {"接听", "接电话", "应答", "answer", "accept"};
     private static final String[] DECLINE_KEYWORDS = {"挂断", "拒接", "结束通话", "decline", "reject", "hang up", "end call"};
+
+    /** 通知里可能是运营商、状态提示而不是来电人姓名。 */
+    private static final String[] NOISE_WORDS = {
+            "移动", "联通", "电信", "运营商", "未知", "陌生", "号码", "主叫", "被叫",
+            "呼叫", "响铃", "振铃", "接通", "未接", "拒接", "挂断", "标记", "骚扰",
+            "广告", "推销", "视频", "语音", "通话", "来电提醒", "volte", "hd"
+    };
 
     /** 点击来电通知上的“接听”按钮。 */
     static boolean acceptCall() {
@@ -108,15 +116,43 @@ public class CallNotificationListener extends NotificationListenerService {
         callActionsAt = 0L;
     }
 
+    /**
+     * 判断一条通知是不是来电通知。
+     * 有些 ROM（华为等）不给通话通知打 CATEGORY_CALL，
+     * 所以再看包名和按钮文案，避免漏掉。
+     */
+    private static boolean looksLikeCall(StatusBarNotification sbn, Notification notification) {
+        if (Notification.CATEGORY_CALL.equals(notification.category)) return true;
+        String pkg = sbn.getPackageName();
+        if (pkg != null) {
+            String lower = pkg.toLowerCase(java.util.Locale.ROOT);
+            if (lower.contains("dialer") || lower.contains("telecom")
+                    || lower.contains("incallui") || lower.endsWith(".phone")) {
+                return true;
+            }
+        }
+        Notification.Action[] actions = notification.actions;
+        if (actions != null) {
+            for (Notification.Action action : actions) {
+                if (action == null || action.title == null) continue;
+                String title = action.title.toString().toLowerCase(java.util.Locale.ROOT);
+                for (String keyword : ANSWER_KEYWORDS) {
+                    if (title.contains(keyword)) return true;
+                }
+                for (String keyword : DECLINE_KEYWORDS) {
+                    if (title.contains(keyword)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
     @Override
     public void onNotificationPosted(StatusBarNotification sbn) {
         try {
             if (sbn == null || sbn.getNotification() == null) return;
             Notification notification = sbn.getNotification();
-            if (notification.category == null
-                    || !Notification.CATEGORY_CALL.equals(notification.category)) {
-                return;
-            }
+            if (!looksLikeCall(sbn, notification)) return;
             if (notification.actions != null && notification.actions.length > 0) {
                 callActions = java.util.Arrays.asList(notification.actions);
                 callActionsAt = System.currentTimeMillis();
@@ -138,25 +174,31 @@ public class CallNotificationListener extends NotificationListenerService {
                 addText(texts, notification.tickerText);
             }
 
+            // 同一条通知里可能既有姓名又有号码（例如标题是姓名、正文是号码），
+            // 两个都记下来：播报时优先用姓名，没有姓名才念号码。
+            String number = null;
+            String name = null;
             for (CharSequence text : texts) {
                 String value = text.toString();
-                Matcher matcher = PHONE_PATTERN.matcher(value);
-                if (matcher.find()) {
-                    pendingNumber = matcher.group(1);
-                    capturedAt = System.currentTimeMillis();
-                    Log.i(TAG, "captured caller number");
-                    return;
+                if (number == null) {
+                    Matcher matcher = PHONE_PATTERN.matcher(value);
+                    if (matcher.find()) number = matcher.group(1);
                 }
+                if (name == null) {
+                    name = cleanName(value);
+                }
+                if (name != null && number != null) break;
             }
-            // 没有号码，但通知里有像人名的文字，也可以用来播报
-            for (CharSequence text : texts) {
-                String name = cleanName(text.toString());
-                if (name != null) {
-                    pendingName = name;
-                    capturedAt = System.currentTimeMillis();
-                    Log.i(TAG, "captured caller name from notification");
-                    return;
-                }
+
+            if (name != null) {
+                pendingName = name;
+                capturedAt = System.currentTimeMillis();
+                Log.i(TAG, "captured caller name from notification");
+            }
+            if (number != null) {
+                pendingNumber = number;
+                capturedAt = System.currentTimeMillis();
+                Log.i(TAG, "captured caller number from notification");
             }
         } catch (Exception e) {
             Log.w(TAG, "onNotificationPosted failed", e);
@@ -167,10 +209,21 @@ public class CallNotificationListener extends NotificationListenerService {
     private static String cleanName(String raw) {
         if (raw == null) return null;
         String value = raw.replaceAll("(?i)(来电|电话|语音通话|视频通话|incoming call|voip)", "")
-                .replaceAll("[\\[\\]（）()<>《》\\s]", "")
+                .replaceAll("[\\[\\]（）()<>《》\\s·,，、|/\\\\-]", "")
                 .trim();
         if (value.length() < 2 || value.length() > 20) return null;
-        return containsDigit(value) ? null : value;
+        if (containsDigit(value)) return null;
+        if (isNoise(value)) return null;
+        return value;
+    }
+
+    /** 运营商名、“未知号码”之类的通知文案不是人名，不能拿去播报。 */
+    private static boolean isNoise(String value) {
+        String lower = value.toLowerCase(java.util.Locale.ROOT);
+        for (String word : NOISE_WORDS) {
+            if (lower.contains(word)) return true;
+        }
+        return false;
     }
 
     private void addText(List<CharSequence> list, CharSequence value) {
