@@ -17,8 +17,9 @@ import java.util.List;
 /**
  * 来电相关能力：接听、挂断。
  *
- * 来电姓名和号码都来自来电通知（{@link CallNotificationListener}），不再读通讯录。
- * 接听优先点通知栏的“接听”按钮，再用 TelephonyManager/TelecomManager 的公开 API；
+ * 来电姓名来源（按可靠性排序）：通讯录号码匹配 -> 通话记录 CACHED_NAME -> 号码。
+ * 接听优先点通知栏的“接听”按钮，再用无障碍服务点/划接听，最后才是
+ * TelephonyManager/TelecomManager 的公开 API（国产 ROM 上多数无效）；
  * 挂断没有公开 API，按“通知栏按钮 -> TelecomManager.endCall -> ITelephony.endCall
  * -> 无障碍点击挂断按钮”依次尝试，每一步都用通话状态验证。
  */
@@ -38,6 +39,64 @@ final class PhoneCallHelper {
 
     static boolean canReadPhoneState(Context context) {
         return hasPermission(context, Manifest.permission.READ_PHONE_STATE);
+    }
+
+    /**
+     * 用号码去通讯录里换姓名。只查这一个号码，不批量读取，也不上传。
+     * 这是最可靠的来源：手机来电界面能显示名字，说明通讯录里一定有对应关系。
+     */
+    static String lookupNameFromContacts(Context context, String number) {
+        if (!hasPermission(context, Manifest.permission.READ_CONTACTS)) return null;
+        String raw = number == null ? "" : number.trim();
+        if (raw.isEmpty()) return null;
+        String digits = raw.replaceAll("[^0-9]", "");
+
+        // 1. 标准号码匹配（会自动处理国家码、空格、横线）
+        android.database.Cursor cursor = null;
+        try {
+            android.net.Uri uri = android.net.Uri.withAppendedPath(
+                    android.provider.ContactsContract.PhoneLookup.CONTENT_FILTER_URI,
+                    android.net.Uri.encode(raw));
+            cursor = context.getContentResolver().query(uri,
+                    new String[]{android.provider.ContactsContract.PhoneLookup.DISPLAY_NAME},
+                    null, null, null);
+            if (cursor != null && cursor.moveToFirst()) {
+                String name = cursor.getString(0);
+                if (name != null && !name.trim().isEmpty()) return name.trim();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "PhoneLookup failed", e);
+        } finally {
+            if (cursor != null) {
+                try { cursor.close(); } catch (Exception ignored) { }
+            }
+        }
+
+        // 2. 有些号码存的是不带国家码的形式，用后 8 位再模糊找一次
+        if (digits.length() < 7) return null;
+        String suffix = digits.substring(digits.length() - 8);
+        try {
+            cursor = context.getContentResolver().query(
+                    android.provider.ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                    new String[]{android.provider.ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                            android.provider.ContactsContract.CommonDataKinds.Phone.NUMBER},
+                    android.provider.ContactsContract.CommonDataKinds.Phone.NUMBER + " LIKE ?",
+                    new String[]{"%" + suffix},
+                    null);
+            int scanned = 0;
+            while (cursor != null && cursor.moveToNext() && scanned++ < 20) {
+                String name = cursor.getString(0);
+                if (name == null || name.trim().isEmpty()) continue;
+                return name.trim();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "contacts suffix lookup failed", e);
+        } finally {
+            if (cursor != null) {
+                try { cursor.close(); } catch (Exception ignored) { }
+            }
+        }
+        return null;
     }
 
     /**
@@ -103,13 +162,14 @@ final class PhoneCallHelper {
         // 2. 无障碍：华为等 ROM 只有这条路能真正点/划到接听（不需要通话权限）
         if (CallAccessibilityService.isRunning()) {
             tried.add("无障碍");
-            for (int attempt = 0; attempt < 3; attempt++) {
+            // 华为的来电界面出现得慢，多试几次、每次多等一会儿
+            for (int attempt = 0; attempt < 4; attempt++) {
                 if (CallAccessibilityService.clickAnswer()
-                        && waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1500)) {
+                        && waitForState(context, TelephonyManager.CALL_STATE_OFFHOOK, 1800)) {
                     result.onResult(true, "已通过无障碍服务接听");
                     return true;
                 }
-                sleepQuietly(300);
+                sleepQuietly(600);
             }
         } else if (CallAccessibilityService.isEnabledInSettings(context)) {
             tried.add("无障碍未连接");
@@ -195,13 +255,13 @@ final class PhoneCallHelper {
 
         if (CallAccessibilityService.isRunning()) {
             tried.add("无障碍");
-            for (int attempt = 0; attempt < 2; attempt++) {
+            for (int attempt = 0; attempt < 3; attempt++) {
                 if (CallAccessibilityService.clickHangUp()
-                        && waitForState(context, TelephonyManager.CALL_STATE_IDLE, 1200)) {
+                        && waitForState(context, TelephonyManager.CALL_STATE_IDLE, 1500)) {
                     result.onResult(true, "已通过无障碍服务挂断");
                     return true;
                 }
-                sleepQuietly(300);
+                sleepQuietly(400);
             }
         }
 

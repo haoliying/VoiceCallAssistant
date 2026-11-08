@@ -89,7 +89,7 @@ public class CallAccessibilityService extends AccessibilityService {
             }
             for (AccessibilityNodeInfo node : nodes) {
                 if (service.click(node)) {
-                    LogStore.append("[无障碍] 已点击“" + what + "”按钮");
+                    LogStore.append("[无障碍] 已点击“" + what + "”按钮 " + service.boundsOf(node));
                     return true;
                 }
             }
@@ -99,7 +99,7 @@ public class CallAccessibilityService extends AccessibilityService {
                 node.getBoundsInScreen(bounds);
                 if (bounds.width() > 0 && bounds.height() > 0
                         && service.tap(bounds.centerX(), bounds.centerY())) {
-                    LogStore.append("[无障碍] 已点按“" + what + "”按钮位置");
+                    LogStore.append("[无障碍] 已点按“" + what + "”按钮位置 " + service.boundsOf(node));
                     return true;
                 }
             }
@@ -124,6 +124,38 @@ public class CallAccessibilityService extends AccessibilityService {
             if (root != null) {
                 sb.append(" ").append(root.getPackageName()).append(":")
                         .append(root.getClassName());
+                String texts = sampleTexts(root);
+                if (!texts.isEmpty()) sb.append(" 文字[").append(texts).append("]");
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 抓几个节点上的文字/描述/资源名，华为的接听控件长什么样一看就知道。 */
+    private String sampleTexts(AccessibilityNodeInfo root) {
+        StringBuilder sb = new StringBuilder();
+        ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
+        queue.add(root);
+        int guard = 0;
+        int picked = 0;
+        while (!queue.isEmpty() && guard++ < 200 && picked < 10) {
+            AccessibilityNodeInfo node = queue.poll();
+            if (node == null) continue;
+            if (node.isVisibleToUser()) {
+                String text = node.getText() == null ? "" : node.getText().toString().trim();
+                String desc = node.getContentDescription() == null ? ""
+                        : node.getContentDescription().toString().trim();
+                String id = node.getViewIdResourceName();
+                String item = !text.isEmpty() ? text : (!desc.isEmpty() ? desc : id);
+                if (item != null && !item.isEmpty()) {
+                    if (sb.length() > 0) sb.append(", ");
+                    sb.append(item);
+                    picked++;
+                }
+            }
+            for (int i = 0; i < node.getChildCount(); i++) {
+                AccessibilityNodeInfo child = node.getChild(i);
+                if (child != null) queue.add(child);
             }
         }
         return sb.toString();
@@ -146,13 +178,22 @@ public class CallAccessibilityService extends AccessibilityService {
         while (!queue.isEmpty() && guard++ < 600) {
             AccessibilityNodeInfo node = queue.poll();
             if (node == null) continue;
-            if (matches(node, labels)) result.add(node);
+            // 只认屏幕上真正看得到的节点，隐藏/离屏节点点了也没用
+            if (node.isVisibleToUser() && matches(node, labels)) result.add(node);
             for (int i = 0; i < node.getChildCount(); i++) {
                 AccessibilityNodeInfo child = node.getChild(i);
                 if (child != null) queue.add(child);
             }
         }
         return result;
+    }
+
+    /** 节点的位置，日志里用来看点击落点对不对。 */
+    private String boundsOf(AccessibilityNodeInfo node) {
+        Rect rect = new Rect();
+        node.getBoundsInScreen(rect);
+        return "(" + rect.centerX() + "," + rect.centerY() + " "
+                + rect.width() + "x" + rect.height() + ")";
     }
 
     private boolean matches(AccessibilityNodeInfo node, String[] labels) {

@@ -248,6 +248,7 @@ public class MainActivity extends AppCompatActivity {
         permissions.add(Manifest.permission.RECORD_AUDIO);
         permissions.add(Manifest.permission.READ_PHONE_STATE);
         permissions.add(Manifest.permission.READ_CALL_LOG);
+        permissions.add(Manifest.permission.READ_CONTACTS);
         permissions.add(Manifest.permission.ANSWER_PHONE_CALLS);
         permissions.add(Manifest.permission.CALL_PHONE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -284,15 +285,21 @@ public class MainActivity extends AppCompatActivity {
     private void updatePermissionSummary() {
         boolean notif = CallNotificationListener.isEnabled(this);
         boolean a11y = CallAccessibilityService.isEnabledInSettings(this);
+        boolean a11yRunning = CallAccessibilityService.isRunning();
         StringBuilder sb = new StringBuilder();
         sb.append("必开：\n");
         sb.append("  录音：").append(stateOf(Manifest.permission.RECORD_AUDIO));
         sb.append("  电话状态：").append(stateOf(Manifest.permission.READ_PHONE_STATE));
         sb.append("  接听电话：").append(stateOf(Manifest.permission.ANSWER_PHONE_CALLS));
-        sb.append("\n  无障碍服务：").append(a11y ? "已开启（靠它点/划接听）" : "未开启（不开启就无法自动接听）");
+        sb.append("\n  无障碍服务：").append(!a11y ? "未开启（不开启就无法自动接听）"
+                : (a11yRunning ? "已连接（靠它点/划接听）"
+                    : "已开启但没连上，去无障碍里关掉再开一次"));
         sb.append("\n  通知使用权：").append(notif ? "已开启（优先用通知里的姓名和按钮）" : "未开启（拿不到姓名和通知按钮）");
         sb.append("\n建议开启：\n");
-        sb.append("  通话记录：").append(stateOf(Manifest.permission.READ_CALL_LOG)).append("（用它补上联系人姓名）");
+        sb.append("  通讯录：").append(stateOf(Manifest.permission.READ_CONTACTS))
+                .append("（把来电号码换成姓名，只查这一个号码）");
+        sb.append("\n  通话记录：").append(stateOf(Manifest.permission.READ_CALL_LOG))
+                .append("（通讯录没找到时补姓名）");
         sb.append("  拨打电话：").append(stateOf(Manifest.permission.CALL_PHONE));
         sb.append("\n  来电筛选：").append(IncomingCallScreeningService.isEnabled(this) ? "已开启" : "未开启");
         tvPermissions.setText(sb.toString());
@@ -323,10 +330,15 @@ public class MainActivity extends AppCompatActivity {
         if (!CallAccessibilityService.isEnabledInSettings(this)) {
             if (guidedSteps.add("accessibility")) {
                 new AlertDialog.Builder(this)
-                        .setTitle("还差一步：无障碍服务")
-                        .setMessage("系统不允许第三方应用直接接听/挂断电话，必须在无障碍设置里打开"
-                                + "“语音助手来电辅助”，应用才能替你点接听、划接听。\n\n"
-                                + "路径：无障碍 → 已下载的应用 → 语音助手来电辅助 → 开启")
+                        .setTitle("还差一步：开启无障碍（华为必须开）")
+                        .setMessage("华为/鸿蒙不允许第三方应用直接接听电话，"
+                                + "必须靠无障碍服务去点“接听”或上滑接听。\n\n"
+                                + "1. 点下面的“去开启”，会直接跳到本服务的开关页；\n"
+                                + "2. 打开“语音助手来电辅助”，弹窗点“允许/确定”；\n"
+                                + "3. 找不到入口时：设置 → 辅助功能 → 无障碍 → 无障碍服务"
+                                + "（有的版本叫“已下载的服务”）→ 语音助手来电辅助。\n\n"
+                                + "华为还常把无障碍服务后台清掉：设置 → 应用和服务 → 应用启动管理 → "
+                                + "语音电话助手 → 关闭“自动管理”，把“允许自启动/允许后台活动”都打开。")
                         .setPositiveButton("去开启", (dialog, which) -> openAccessibilitySettings())
                         .setNegativeButton("稍后", null)
                         .show();
@@ -350,9 +362,23 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void openAccessibilitySettings() {
+        // 优先直接跳到本服务的开关页（Android 11+），省得用户在一长串列表里翻
+        ComponentName component = new ComponentName(this, CallAccessibilityService.class);
+        Intent detail = new Intent("android.settings.ACCESSIBILITY_DETAILS_SETTINGS");
+        detail.putExtra("android.intent.extra.COMPONENT_NAME", component.flattenToString());
+        detail.putExtra("android.provider.extra.COMPONENT_NAME", component.flattenToString());
+        try {
+            startActivity(detail);
+            Toast.makeText(this, "把“语音助手来电辅助”打开（华为有时要点右上角“允许”）",
+                    Toast.LENGTH_LONG).show();
+            return;
+        } catch (Exception ignored) {
+            // 部分鸿蒙版本没有这个页面，退回到无障碍总列表
+        }
         try {
             startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
-            Toast.makeText(this, "在列表里找到“语音助手来电辅助”并开启", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "无障碍 → 无障碍服务 / 已下载的服务 → 语音助手来电辅助 → 开启",
+                    Toast.LENGTH_LONG).show();
         } catch (Exception e) {
             appendDebug("无法打开无障碍设置: " + e.getMessage());
         }

@@ -8,9 +8,11 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
-    <!-- 来电识别（姓名来自通话通知，号码来自系统回调/通知） -->
+    <!-- 来电识别（姓名来自通讯录/通话记录，号码来自系统回调/通知） -->
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <uses-permission android:name="android.permission.READ_CALL_LOG" />
+    <!-- 只用来把来电号码换成姓名：查这一个号码，不批量读取、不上传 -->
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
     <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
     <uses-permission android:name="android.permission.CALL_PHONE" />
 

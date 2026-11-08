@@ -102,10 +102,14 @@ public class VoiceService extends Service {
     private static final long HEARTBEAT_INTERVAL_MS = 10000L;
     /** 号码播报语速（<1 更慢）。0.92 ≈ 比正常稍慢一点，念号码更清楚。 */
     private static final float DIGIT_SPEED = 0.92f;
-    /** 一轮播报结束到下一轮开始之间的静默间隔，留给用户下指令。 */
-    private static final long RING_GAP_MS = 1200L;
-    /** 兜底上限，防止状态判断失灵时无限播报。 */
-    private static final int MAX_RING_ROUNDS = 30;
+    /**
+     * 一轮播报结束到下一轮开始之间的静默间隔，留给用户下指令。
+     * 播报期间麦克风是关着的（否则会把自己的声音识别成指令），
+     * 所以这段静默必须够长，用户才来得及说“接电话”。
+     */
+    private static final long RING_GAP_MS = 4500L;
+    /** 最多念几遍。念太多遍会把整段响铃时间都占满，用户没有干净的时间说话。 */
+    private static final int MAX_RING_ROUNDS = 4;
     /** 等整句号码合成的上限，超时就现场合成一次（不再拼接单字）。 */
     private static final long NUMBER_WAIT_MS = 3500L;
 
@@ -161,6 +165,8 @@ public class VoiceService extends Service {
     private volatile int answerAttempts = 0;
     private volatile long lastAnswerAttemptAt = 0L;
     private volatile long answerFailedAt = 0L;
+    /** 本次响铃是否已经查过通讯录/通话记录，避免每轮都查一遍。 */
+    private volatile boolean nameLookupTried = false;
     /**
      * 整个号码一句话合成好的音频（按号码缓存 6 条）。
      * 拼接单个数字会丢掉自然的气息和连读，听起来“喘不上气”，
@@ -986,6 +992,11 @@ public class VoiceService extends Service {
                 int bytesRead = audioRecord.read(buffer, 0, buffer.length);
                 if (bytesRead < 0) break;
 
+                // 半双工：正在播报时把麦克风数据直接丢掉。
+                // 否则喇叭的声音会被当成用户说话，日志里全是“接到 都 灵 一霸 肌肤”，
+                // 真正的“接电话”反而被淹没。
+                if (speaking) continue;
+
                 if (bytesRead > 0 && recognizer != null && modelReady) {
                     try {
                         if (recognizer.acceptWaveForm(buffer, bytesRead)) {
@@ -1153,7 +1164,6 @@ public class VoiceService extends Service {
                     skipped = true;
                 } else {
                     abortSpeech = false;
-                    speaking = true;
                     try {
                         GeneratedAudio audio = currentTts.generate(text);
                         if (audio != null && audio.getSamples() != null && audio.getSamples().length > 0) {
@@ -1161,6 +1171,8 @@ public class VoiceService extends Service {
                                 broadcastDebug("[tts] 已收到指令，跳过本次播报");
                             } else {
                                 currentSpeechText = text;
+                                // 只在真正放音时关麦克风：合成本身不出声，这几秒还是要听指令
+                                speaking = true;
                                 playAudio(audio.getSamples(), audio.getSampleRate());
                                 broadcastDebug("[tts-ok] 播报完成");
                             }
@@ -1257,7 +1269,12 @@ public class VoiceService extends Service {
             answerFailedAt = 0L;
             answerAttempts = 0;
             lastAnswerAttemptAt = 0L;
+            nameLookupTried = false;
             logCallPermissions();
+            broadcastDebug("[来电] 无障碍=" + (CallAccessibilityService.isRunning()
+                    ? "已连接（可点/划接听）"
+                    : (CallAccessibilityService.isEnabledInSettings(this)
+                        ? "已开启但未连接" : "未开启（自动接听会失败）")));
             startRingAnnouncements();
         } else if (state == TelephonyManager.CALL_STATE_OFFHOOK) {
             if (previous == TelephonyManager.CALL_STATE_OFFHOOK) return;
@@ -1342,7 +1359,21 @@ public class VoiceService extends Service {
             } while (!destroyed && SystemClock.elapsedRealtime() < deadline
                     && callState == TelephonyManager.CALL_STATE_RINGING);
         }
-        // 来电通知读不到时，退一步用通话记录里系统缓存的姓名（华为会写入联系人名字）
+        // 来电通知读不到时，用通讯录按号码换姓名（手机能显示名字，说明通讯录里一定有）
+        if ((callerName == null || callerName.isEmpty()) && !callerNumber.isEmpty()
+                && !nameLookupTried) {
+            nameLookupTried = true;
+            String fromContacts = PhoneCallHelper.lookupNameFromContacts(this, callerNumber);
+            if (fromContacts != null && !fromContacts.isEmpty()) {
+                callerName = fromContacts;
+                broadcastDebug("[来电] 从通讯录读到姓名: " + fromContacts);
+            } else if (!PhoneCallHelper.hasPermission(this, Manifest.permission.READ_CONTACTS)) {
+                broadcastDebug("[来电] 通讯录未授权，姓名只能靠通话记录（建议在权限页打开通讯录）");
+            } else {
+                broadcastDebug("[来电] 通讯录里没有这个号码");
+            }
+        }
+        // 再退一步：通话记录里系统缓存的姓名（华为会写入联系人名字）
         if ((callerName == null || callerName.isEmpty()) && !callerNumber.isEmpty()) {
             String fromCallLog = PhoneCallHelper.lookupNameFromCallLog(this, callerNumber);
             if (fromCallLog != null && !fromCallLog.isEmpty()) {
@@ -1503,7 +1534,6 @@ public class VoiceService extends Service {
                 skipped = true;
             } else {
                 abortSpeech = false;
-                speaking = true;
                 try {
                     // 整句合成：先等预热结果，等不到就现场合成，绝不退回单字拼接
                     float[] audio = waitForNumberAudio(digits, NUMBER_WAIT_MS);
@@ -1515,6 +1545,7 @@ public class VoiceService extends Service {
                         if (audio != null && audio.length > 0 && !destroyed
                                 && epoch == speechEpoch && !abortSpeech) {
                             currentSpeechText = digits + "来电话";
+                            speaking = true;
                             playAudio(audio, ttsCacheRate);
                             broadcastDebug("[tts-ok] 号码播报完成");
                         } else if (abortSpeech) {
@@ -1672,7 +1703,11 @@ public class VoiceService extends Service {
                     // 只提示一次，避免一直重复；电话已经结束时不再出声
                     if (!answerFailureReported) {
                         answerFailureReported = true;
-                        speak("没能接通，请手动操作");
+                        if (CallAccessibilityService.isEnabledInSettings(this)) {
+                            speak("没能接通，无障碍服务没有连上，请重新打开一次");
+                        } else {
+                            speak("没能接通，需要先在设置里开启无障碍服务");
+                        }
                     }
                     handler.postDelayed(ringAnnouncer, 1500L);
                 });
