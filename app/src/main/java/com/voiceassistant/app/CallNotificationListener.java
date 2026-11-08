@@ -172,12 +172,23 @@ public class CallNotificationListener extends NotificationListenerService {
                 break;
             }
         }
+        boolean hasCallWord = false;
+        for (CharSequence text : texts) {
+            if (text == null) continue;
+            String value = text.toString().toLowerCase(Locale.ROOT);
+            if (value.contains("来电") || value.contains("呼入") || value.contains("响铃")
+                    || value.contains("incoming call") || value.contains("正在呼叫")) {
+                hasCallWord = true;
+                break;
+            }
+        }
         if (Notification.CATEGORY_CALL.equals(notification.category)) return true;
         String pkg = sbn.getPackageName();
         String lower = pkg == null ? "" : pkg.toLowerCase(Locale.ROOT);
         boolean fromPhoneApp = lower.contains("dialer") || lower.contains("telecom")
                 || lower.contains("incallui") || lower.endsWith(".phone");
-        if (fromPhoneApp && (hasNumber || hasAnswerAction)) return true;
+        // 拨号进程发的“来电”通知即使没给号码，也要收下——姓名可能就在标题里
+        if (fromPhoneApp && (hasNumber || hasAnswerAction || hasCallWord)) return true;
         // 其它应用（包括部分 ROM 的通话界面）只有同时出现号码和接听按钮时才认
         return hasNumber && hasAnswerAction;
     }
@@ -312,10 +323,13 @@ public class CallNotificationListener extends NotificationListenerService {
      */
     private static String cleanName(String raw) {
         if (raw == null) return null;
-        // 先在原文上排掉“高清通话/中国移动/未接来电”这类整句提示，
+        // 先把括号里的运营商/提示去掉（“张三（中国移动）”里的“中国移动”），
+        // 否则整条文案会被当成噪声丢掉，姓名也跟着丢了
+        String withoutBrackets = raw.replaceAll("[（(\\[【<《][^）)\\]】>》]*[）)\\]】>》]", " ");
+        // 再在剩下的部分上排掉“高清通话/中国移动/未接来电”这类整句提示，
         // 否则去掉“通话”两个字后可能剩下“高清”被当成人名
-        if (isNoise(raw)) return null;
-        String value = BRACKET_NUMBER.matcher(raw).replaceAll(" ")
+        if (isNoise(withoutBrackets)) return null;
+        String value = BRACKET_NUMBER.matcher(withoutBrackets).replaceAll(" ")
                 .replaceAll("(?i)(incoming call|voip|来电|电话|语音通话|视频通话)", "")
                 .replaceAll("[\\[\\]（）()<>《》\\s·,，、|/\\\\-]", "")
                 .trim();

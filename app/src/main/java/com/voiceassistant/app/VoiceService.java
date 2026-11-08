@@ -1382,6 +1382,17 @@ public class VoiceService extends Service {
             }
         }
 
+        // 最后一道保险：名字里带数字的多半是号码本身，
+        // 直接送进 TTS 会读成“一万八千五百……”而不是一位一位念
+        if (callerName != null && (callerName.isEmpty()
+                || PhoneCallHelper.containsDigit(callerName))) {
+            broadcastDebug("[来电] 姓名不像人名（" + callerName + "），改念号码");
+            callerName = null;
+        }
+        if (callerNumber.isEmpty()) {
+            broadcastDebug("[来电] 系统没给来电号码，查不了姓名，只能播“有来电”");
+        }
+
         if (destroyed) return;
         if (!isPhoneStillRinging()) {
             onRingingGone();
@@ -1395,13 +1406,6 @@ public class VoiceService extends Service {
         updateNotification(currentStatus);
 
         if (AppSettings.isAnnounceCaller(this)) {
-            // 陌生号码：先把整句合成起来，拼数字会丢掉连读和气息
-            if ((callerName == null || callerName.isEmpty()) && !callerNumber.isEmpty()) {
-                final String raw = callerNumber;
-                if (cachedNumberAudio(raw.replaceAll("[^0-9]", "")) == null) {
-                    new Thread(() -> prewarmNumberAudio(raw), "tts-number").start();
-                }
-            }
             Runnable nextRound = () -> {
                 if (destroyed) return;
                 if (isPhoneStillRinging()) {
@@ -1410,6 +1414,19 @@ public class VoiceService extends Service {
                     onRingingGone();
                 }
             };
+            // 系统静音 / 勿扰 / 铃声音量为 0：用户不希望出声，只保留听指令接听
+            if (isSystemSilenced()) {
+                broadcastDebug("[来电] 系统处于静音或勿扰，本次不播报（仍可喊口令接听）");
+                nextRound.run();
+                return;
+            }
+            // 陌生号码：先把整句合成起来，拼数字会丢掉连读和气息
+            if ((callerName == null || callerName.isEmpty()) && !callerNumber.isEmpty()) {
+                final String raw = callerNumber;
+                if (cachedNumberAudio(raw.replaceAll("[^0-9]", "")) == null) {
+                    new Thread(() -> prewarmNumberAudio(raw), "tts-number").start();
+                }
+            }
             if (callerName != null && !callerName.isEmpty()) {
                 speak(callerName + "来电话", true, nextRound);
             } else if (!callerNumber.isEmpty()) {
@@ -1420,6 +1437,29 @@ public class VoiceService extends Service {
         } else {
             stopRingAnnouncements();
         }
+    }
+
+    /**
+     * 系统是否处于“不要出声”的状态：静音模式、铃声音量为 0、勿扰完全静音。
+     * 只影响来电播报，用户主动问时间/喊口令时照常回答。
+     */
+    private boolean isSystemSilenced() {
+        try {
+            AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+            if (audioManager != null) {
+                if (audioManager.getRingerMode() == AudioManager.RINGER_MODE_SILENT) return true;
+                if (audioManager.getStreamVolume(AudioManager.STREAM_RING) <= 0) return true;
+            }
+            NotificationManager notificationManager =
+                    (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (notificationManager != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                int filter = notificationManager.getCurrentInterruptionFilter();
+                if (filter == NotificationManager.INTERRUPTION_FILTER_NONE) return true;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "check silence failed", e);
+        }
+        return false;
     }
 
     /** 响铃已经结束（对方挂断或超时），同步状态并立即收声。 */

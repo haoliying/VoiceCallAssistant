@@ -41,6 +41,15 @@ final class PhoneCallHelper {
         return hasPermission(context, Manifest.permission.READ_PHONE_STATE);
     }
 
+    /** 姓名里带数字的多半是号码本身（CACHED_NAME 或通知里存的就是号码），不能当名字念。 */
+    static boolean containsDigit(String value) {
+        if (value == null) return false;
+        for (int i = 0; i < value.length(); i++) {
+            if (Character.isDigit(value.charAt(i))) return true;
+        }
+        return false;
+    }
+
     /**
      * 用号码去通讯录里换姓名。只查这一个号码，不批量读取，也不上传。
      * 这是最可靠的来源：手机来电界面能显示名字，说明通讯录里一定有对应关系。
@@ -62,7 +71,9 @@ final class PhoneCallHelper {
                     null, null, null);
             if (cursor != null && cursor.moveToFirst()) {
                 String name = cursor.getString(0);
-                if (name != null && !name.trim().isEmpty()) return name.trim();
+                if (name != null && !name.trim().isEmpty() && !containsDigit(name)) {
+                    return name.trim();
+                }
             }
         } catch (Exception e) {
             Log.w(TAG, "PhoneLookup failed", e);
@@ -86,7 +97,7 @@ final class PhoneCallHelper {
             int scanned = 0;
             while (cursor != null && cursor.moveToNext() && scanned++ < 20) {
                 String name = cursor.getString(0);
-                if (name == null || name.trim().isEmpty()) continue;
+                if (name == null || name.trim().isEmpty() || containsDigit(name)) continue;
                 return name.trim();
             }
         } catch (Exception e) {
@@ -122,8 +133,8 @@ final class PhoneCallHelper {
                 if (name == null) continue;
                 name = name.trim();
                 if (name.isEmpty()) continue;
-                // 有些记录里 CACHED_NAME 直接是号码
-                if (name.replaceAll("[^0-9]", "").equals(digits)) continue;
+                // CACHED_NAME 里可能直接存号码（带国家码/横线），播出去就成了“一万八千…”
+                if (containsDigit(name)) continue;
                 return name;
             }
         } catch (Exception e) {
