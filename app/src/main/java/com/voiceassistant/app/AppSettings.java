@@ -19,6 +19,12 @@ final class AppSettings {
     private static final String KEY_ANSWER = "cmd_answer";
     private static final String KEY_HANGUP = "cmd_hangup";
     private static final String KEY_ANNOUNCE_CALLER = "announce_caller";
+    private static final String KEY_ASR_MODEL = "asr_model";
+
+    /** 内置的 66MB 小模型，够用、占内存少。 */
+    static final String ASR_MODEL_STANDARD = "standard";
+    /** 需要另外下载 1.3GB 的高清模型，嘈杂环境、口音重时明显更准。 */
+    static final String ASR_MODEL_HD = "hd";
 
     private AppSettings() {}
 
@@ -40,6 +46,18 @@ final class AppSettings {
 
     static boolean isAnnounceCaller(Context context) {
         return prefs(context).getBoolean(KEY_ANNOUNCE_CALLER, true);
+    }
+
+    static String getAsrModel(Context context) {
+        String value = prefs(context).getString(KEY_ASR_MODEL, ASR_MODEL_STANDARD);
+        return ASR_MODEL_HD.equals(value) ? ASR_MODEL_HD : ASR_MODEL_STANDARD;
+    }
+
+    static void setAsrModel(Context context, String model) {
+        prefs(context).edit()
+                .putString(KEY_ASR_MODEL,
+                        ASR_MODEL_HD.equals(model) ? ASR_MODEL_HD : ASR_MODEL_STANDARD)
+                .apply();
     }
 
     static void save(Context context, String timeQuery, String answer, String hangup,

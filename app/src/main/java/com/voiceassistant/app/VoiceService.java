@@ -1,6 +1,7 @@
 package com.voiceassistant.app;
 
 import android.Manifest;
+import android.app.ActivityManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -97,6 +98,15 @@ public class VoiceService extends Service {
     private static final String TTS_DIR_NAME = "tts-model";
     private static final String TTS_TMP_DIR_NAME = "tts-model.tmp";
     private static final String TTS_ARCHIVE_REL = "downloads/tts-model.tar.bz2";
+
+    /** 高清识别模型：vosk-model-cn-0.22，约 1.27GB，准确率比内置小模型高一大截。 */
+    private static final String HD_MODEL_URL =
+            "https://alphacephei.com/vosk/models/vosk-model-cn-0.22.zip";
+    private static final String HD_DIR_NAME = "vosk-model-hd";
+    private static final String HD_TMP_DIR_NAME = "vosk-model-hd.tmp";
+    private static final String HD_ARCHIVE_REL = "downloads/vosk-model-hd.zip";
+    /** 解压后目录至少这么大才认为是完整的（小模型约 66MB，高清约 1.3GB）。 */
+    private static final long HD_MODEL_MIN_BYTES = 900L * 1024 * 1024;
     /** 只解压了一半的 onnx 文件不可能这么大（完整的 theresa.onnx 约 117MB），用来判断模型是否完整。 */
     private static final long MIN_MODEL_FILE_SIZE = 100L * 1024 * 1024;
     private static final long HEARTBEAT_INTERVAL_MS = 10000L;
@@ -119,6 +129,10 @@ public class VoiceService extends Service {
     // Vosk (speech recognition)
     private Model voskModel;
     private Recognizer recognizer;
+    /** 高清模型后台下载完成后置位，识别线程在下一帧自行换模型，不打断服务。 */
+    private volatile boolean switchToHdPending;
+    private volatile File pendingHdDir;
+    private Thread hdDownloadThread;
     private AudioRecord audioRecord;
     /** 系统自带的音频效果，能用就挂上，不能用就靠 AudioPreprocessor 的软件降噪。 */
     private android.media.audiofx.NoiseSuppressor noiseSuppressor;
@@ -303,10 +317,263 @@ public class VoiceService extends Service {
             markerFile.createNewFile();
         }
 
-        voskModel = new Model(modelPath);
+        // 用户选了高清模型：已下载就直接用；没下载就先用标准模型顶住，
+        // 在后台下载/解压，完成后识别线程热切换到高清模型。
+        // 不能在这里同步下载 1.27GB：那样整个服务会停在“初始化中”，
+        // 下载期间来电话既不会播报也接不了。
+        File hdDir = new File(getFilesDir(), HD_DIR_NAME);
+        if (AppSettings.ASR_MODEL_HD.equals(AppSettings.getAsrModel(this))) {
+            if (isHdModelReady(hdDir)) {
+                if (hasEnoughMemoryForHd()) {
+                    modelDir = hdDir;
+                    broadcastDebug("[asr] 使用高清识别模型（解压后约2GB）");
+                } else {
+                    broadcastDebug("[asr] 内存不足，高清模型改用内置标准模型");
+                }
+            } else {
+                broadcastDebug("[asr] 高清模型还没下载，先用标准模型顶上");
+                startHdModelDownload(hdDir);
+            }
+        } else {
+            broadcastDebug("[asr] 使用内置标准识别模型");
+        }
+
+        voskModel = loadVoskModelWithFallback(modelDir, new File(modelPath));
         recognizer = new Recognizer(voskModel, SAMPLE_RATE);
         lastError = "";
         broadcastDebug("[ok] 语音识别引擎就绪 (Vosk)");
+    }
+
+    /** 高清模型加载失败（内存不够、文件损坏）时退回内置标准模型，别把整个服务拖死。 */
+    private Model loadVoskModelWithFallback(File preferred, File standard) throws Exception {
+        if (preferred.equals(standard)) {
+            return new Model(preferred.getAbsolutePath());
+        }
+        try {
+            return new Model(preferred.getAbsolutePath());
+        } catch (Exception | OutOfMemoryError e) {
+            broadcastDebug("[asr] 高清模型加载失败，改用标准模型: " + e);
+            return new Model(standard.getAbsolutePath());
+        }
+    }
+
+    /** 高清模型是否已经完整解压到本地。 */
+    private boolean isHdModelReady(File dir) {
+        if (dir == null || !dir.isDirectory()) return false;
+        return findFileByName(dir, "final.mdl") != null && findDir(dir, "graph") != null;
+    }
+
+    /** 1.3GB 的模型在低内存机器上会直接把进程撑爆，先看总内存。 */
+    private boolean hasEnoughMemoryForHd() {
+        try {
+            ActivityManager am = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            if (am != null) {
+                ActivityManager.MemoryInfo info = new ActivityManager.MemoryInfo();
+                am.getMemoryInfo(info);
+                long totalMb = info.totalMem / 1024 / 1024;
+                if (totalMb < 3000) {
+                    broadcastDebug("[asr] 总内存只有 " + totalMb + "MB，不建议加载高清模型");
+                    return false;
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "read memory info failed", e);
+        }
+        return true;
+    }
+
+    /** 下载并解压高清识别模型；已经下载过的压缩包会续传。 */
+    private void prepareHdModel(File hdDir) throws IOException {
+        File archive = new File(getFilesDir(), HD_ARCHIVE_REL);
+        long available = -1;
+        try {
+            available = new StatFs(getFilesDir().getAbsolutePath()).getAvailableBytes();
+        } catch (Exception e) {
+            Log.w(TAG, "check free space failed", e);
+        }
+        // 压缩包 1.27GB + 解压后约 2.0GB，留一点余量
+        long needed = 3500L * 1024 * 1024;
+        if (available >= 0 && available < needed) {
+            throw new IOException("存储空间不足：高清模型需要约 3.4GB，当前可用 "
+                    + (available / 1024 / 1024) + "MB");
+        }
+
+        if (!archive.isFile() || archive.length() == 0) {
+            broadcastDebug("[asr] 开始下载高清识别模型(约1.27GB，支持断点续传)");
+            setLoadingDetail("开始下载高清识别模型...");
+        }
+        downloadArchiveIfNeeded(archive, HD_MODEL_URL, "高清识别模型");
+        extractZipArchive(archive, hdDir);
+        if (archive.delete()) {
+            broadcastDebug("[asr] 已删除下载的压缩包，释放 1.27GB");
+        }
+        broadcastDebug("[asr] 高清识别模型已就绪");
+    }
+
+    /** 后台下载+解压高清模型；下载期间服务照常用标准模型工作。 */
+    private void startHdModelDownload(final File hdDir) {
+        if (hdDownloadThread != null && hdDownloadThread.isAlive()) return;
+        hdDownloadThread = new Thread(() -> {
+            acquireWakeLock();
+            try {
+                prepareHdModel(hdDir);
+                if (!AppSettings.ASR_MODEL_HD.equals(AppSettings.getAsrModel(this))) {
+                    broadcastDebug("[asr] 高清模型已下载，但当前选择是标准模型，暂不切换");
+                    return;
+                }
+                if (!hasEnoughMemoryForHd()) {
+                    broadcastDebug("[asr] 高清模型已下载，但内存不足，继续用标准模型");
+                    return;
+                }
+                pendingHdDir = hdDir;
+                switchToHdPending = true;
+                broadcastDebug("[asr] 高清模型下载完成，马上切换识别引擎");
+            } catch (Exception e) {
+                broadcastDebug("[asr] 高清模型下载失败，继续用标准模型: " + e.getMessage());
+            } finally {
+                releaseWakeLock();
+            }
+        }, "hd-model-download");
+        hdDownloadThread.start();
+    }
+
+    /**
+     * 热切换识别模型：识别线程自己调用，先建好新引擎再关旧的，
+     * 失败时保留原来的标准模型，不会影响正在监听的会话。
+     */
+    private boolean applyHdModel(File hdDir) {
+        if (!isHdModelReady(hdDir)) {
+            broadcastDebug("[asr] 高清模型文件不完整，继续用标准模型");
+            return false;
+        }
+        if (!AppSettings.ASR_MODEL_HD.equals(AppSettings.getAsrModel(this))) {
+            broadcastDebug("[asr] 已切回标准模型，忽略高清模型");
+            return false;
+        }
+        try {
+            Model newModel = new Model(hdDir.getAbsolutePath());
+            Recognizer newRecognizer = new Recognizer(newModel, SAMPLE_RATE);
+            Recognizer oldRecognizer = recognizer;
+            Model oldModel = voskModel;
+            recognizer = newRecognizer;
+            voskModel = newModel;
+            if (oldRecognizer != null) {
+                try { oldRecognizer.close(); } catch (Exception ignored) { }
+            }
+            if (oldModel != null) {
+                try { oldModel.close(); } catch (Exception ignored) { }
+            }
+            broadcastDebug("[asr] 已切换到高清识别模型");
+            setLoadingDetail("高清识别模型已启用");
+            return true;
+        } catch (Exception | OutOfMemoryError e) {
+            broadcastDebug("[asr] 切换高清模型失败，继续用标准模型: " + e);
+            return false;
+        }
+    }
+
+    /** 解开 Vosk 的 zip 包：去掉顶层目录，逐条写盘，带进度。 */
+    private void extractZipArchive(File archive, File finalDir) throws IOException {
+        // 用 ZipFile 而不是 ZipInputStream：ZipInputStream 读的时候 getSize() 常是 -1，
+        // 没法校验，也没法提前算出总解压体积（压缩包 1.27GB，解开后约 2.0GB）。
+        java.util.zip.ZipFile zip = null;
+        try {
+            zip = new java.util.zip.ZipFile(archive);
+
+            // 第一遍：只统计要写盘的文件和总字节数，作为进度分母
+            long totalBytes = 0;
+            int totalFiles = 0;
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> counter = zip.entries();
+            while (counter.hasMoreElements()) {
+                java.util.zip.ZipEntry entry = counter.nextElement();
+                if (entry.isDirectory() || strippedName(entry).isEmpty()) continue;
+                totalFiles++;
+                if (entry.getSize() > 0) totalBytes += entry.getSize();
+            }
+            broadcastDebug("[asr] 开始解压：共 " + totalFiles + " 个文件，解开后约 "
+                    + (totalBytes / 1024 / 1024) + "MB");
+            setLoadingDetail("正在解压高清识别模型 0%");
+
+            File tmpDir = new File(getFilesDir(), HD_TMP_DIR_NAME);
+            deleteRecursive(tmpDir);
+            if (!tmpDir.mkdirs() && !tmpDir.isDirectory()) {
+                throw new IOException("无法创建临时目录");
+            }
+
+            // 第二遍：真正写盘
+            int fileCount = 0;
+            long writtenBytes = 0;
+            long lastLogAt = 0;
+            byte[] buffer = new byte[128 * 1024];
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> entries = zip.entries();
+            while (entries.hasMoreElements()) {
+                if (destroyed) throw new IOException("服务已停止，解压中断");
+                java.util.zip.ZipEntry entry = entries.nextElement();
+                if (entry.isDirectory()) continue;
+                String name = strippedName(entry);
+                if (name.isEmpty() || name.contains("..")) continue;
+
+                File outputFile = new File(tmpDir, name);
+                File parent = outputFile.getParentFile();
+                if (parent != null && !parent.exists()) parent.mkdirs();
+
+                long entryWritten = 0;
+                java.io.InputStream in = zip.getInputStream(entry);
+                FileOutputStream out = new FileOutputStream(outputFile);
+                try {
+                    int len;
+                    while ((len = in.read(buffer)) != -1) {
+                        if (destroyed) throw new IOException("服务已停止，解压中断");
+                        out.write(buffer, 0, len);
+                        entryWritten += len;
+                        writtenBytes += len;
+
+                        long now = SystemClock.elapsedRealtime();
+                        if (now - lastLogAt >= 5000) {
+                            lastLogAt = now;
+                            int percent = totalBytes > 0
+                                    ? (int) Math.min(99, writtenBytes * 100 / totalBytes) : 0;
+                            setLoadingDetail("正在解压高清识别模型 " + percent + "%（已写入 "
+                                    + (writtenBytes / 1024 / 1024) + "MB）");
+                        }
+                    }
+                } finally {
+                    closeQuietly(in);
+                    closeQuietly(out);
+                }
+
+                if (entry.getSize() >= 0 && entryWritten != entry.getSize()) {
+                    throw new IOException("解压不完整: " + name + " ("
+                            + entryWritten + "/" + entry.getSize() + ")");
+                }
+                fileCount++;
+            }
+
+            if (destroyed) throw new IOException("服务已停止，解压中断");
+            setLoadingDetail("正在解压高清识别模型 100%");
+            broadcastDebug("[asr] 解压完成，共 " + fileCount + " 个文件");
+
+            if (!isHdModelReady(tmpDir)) {
+                broadcastModelDir(tmpDir);
+                deleteRecursive(tmpDir);
+                throw new IOException("解压后缺少模型文件");
+            }
+            deleteRecursive(finalDir);
+            if (!tmpDir.renameTo(finalDir)) {
+                deleteRecursive(tmpDir);
+                throw new IOException("无法写入模型目录");
+            }
+        } finally {
+            closeQuietly(zip);
+        }
+    }
+
+    /** Vosk 的包带一层 "vosk-model-cn-0.22/" 顶层目录，这里剥掉。 */
+    private static String strippedName(java.util.zip.ZipEntry entry) {
+        String name = entry.getName().replace('\\', '/');
+        int slashIndex = name.indexOf('/');
+        if (slashIndex >= 0) name = name.substring(slashIndex + 1);
+        return name;
     }
 
     // ========== SherpaOnnx TTS ==========
@@ -390,7 +657,7 @@ public class VoiceService extends Service {
         }
 
         // 下载失败时保留已下载的部分，下次启动可以续传
-        downloadArchiveIfNeeded(archive);
+        downloadArchiveIfNeeded(archive, TTS_MODEL_URL, "语音模型");
 
         try {
             extractArchive(archive, modelDir);
@@ -458,16 +725,16 @@ public class VoiceService extends Service {
                 String.join(",", rules));
     }
 
-    private void downloadArchiveIfNeeded(File archive) throws IOException {
+    private void downloadArchiveIfNeeded(File archive, String url, String label) throws IOException {
         File parent = archive.getParentFile();
         if (parent != null && !parent.exists() && !parent.mkdirs()) {
             throw new IOException("无法创建下载目录");
         }
 
-        long remoteSize = fetchRemoteSize();
+        long remoteSize = fetchRemoteSize(url);
         long localSize = archive.isFile() ? archive.length() : 0L;
         if (remoteSize > 0 && localSize == remoteSize) {
-            broadcastDebug("[tts] 模型包已完整下载，跳过下载");
+            broadcastDebug("[下载] 模型包已完整，跳过下载");
             return;
         }
         if (remoteSize > 0 && localSize > remoteSize) {
@@ -477,12 +744,12 @@ public class VoiceService extends Service {
         IOException lastFailure = null;
         for (int attempt = 1; attempt <= 3; attempt++) {
             try {
-                downloadOnce(archive);
+                downloadOnce(archive, url, label);
                 return;
             } catch (IOException e) {
                 lastFailure = e;
                 if (destroyed) throw e;
-                broadcastDebug("[tts] 下载失败(" + attempt + "/3): " + e.getMessage());
+                broadcastDebug("[下载] 失败(" + attempt + "/3): " + e.getMessage());
                 setLoadingDetail("下载中断，正在重试(" + attempt + "/3)...");
                 sleepQuietly(2000);
             }
@@ -491,11 +758,11 @@ public class VoiceService extends Service {
                 + (lastFailure != null ? lastFailure.getMessage() : "未知错误"), lastFailure);
     }
 
-    private void downloadOnce(File archive) throws IOException {
+    private void downloadOnce(File archive, String url, String label) throws IOException {
         long startAt = archive.isFile() ? archive.length() : 0L;
         if (startAt < 0) startAt = 0;
 
-        HttpURLConnection conn = openConnection(TTS_MODEL_URL, startAt, "GET");
+        HttpURLConnection conn = openConnection(url, startAt, "GET");
         int responseCode;
         try {
             responseCode = conn.getResponseCode();
@@ -524,7 +791,7 @@ public class VoiceService extends Service {
             throw new IOException("HTTP " + responseCode);
         }
 
-        broadcastDebug("[tts] 下载: HTTP " + responseCode + "，已下载 "
+        broadcastDebug("[下载] HTTP " + responseCode + "，已下载 "
                 + (startAt / 1024 / 1024) + "MB"
                 + (expectedTotal > 0 ? " / 共 " + (expectedTotal / 1024 / 1024) + "MB" : ""));
 
@@ -547,7 +814,7 @@ public class VoiceService extends Service {
                     if (percent >= lastPercent + 2 || percent == 100) {
                         lastPercent = percent;
                         int safePercent = Math.min(percent, 100);
-                        setLoadingDetail("正在下载语音模型 " + safePercent + "%（"
+                        setLoadingDetail("正在下载" + label + " " + safePercent + "%（"
                                 + (written / 1024 / 1024) + "/" + (expectedTotal / 1024 / 1024) + "MB）");
                     }
                 }
@@ -564,7 +831,7 @@ public class VoiceService extends Service {
             if (actual > expectedTotal) archive.delete(); // 续传位置错了，下次从头来
             throw new IOException("文件不完整: " + actual + "/" + expectedTotal);
         }
-        broadcastDebug("[tts] 下载完成: " + (archive.length() / 1024 / 1024) + "MB");
+        broadcastDebug("[下载] 完成: " + (archive.length() / 1024 / 1024) + "MB");
     }
 
     private HttpURLConnection openConnection(String urlStr, long rangeStart, String method) throws IOException {
@@ -597,10 +864,10 @@ public class VoiceService extends Service {
     }
 
     /** 通过 HEAD 请求拿到服务器上的文件大小，用来判断本地压缩包是否已经下载完整。 */
-    private long fetchRemoteSize() {
+    private long fetchRemoteSize(String url) {
         HttpURLConnection conn = null;
         try {
-            conn = openConnection(TTS_MODEL_URL, 0, "HEAD");
+            conn = openConnection(url, 0, "HEAD");
             if (conn.getResponseCode() == HttpURLConnection.HTTP_OK) {
                 return conn.getContentLengthLong();
             }
@@ -1057,6 +1324,14 @@ public class VoiceService extends Service {
                     new AudioPreprocessor(SAMPLE_RATE, automaticGainControl == null);
 
             while (isListening) {
+                // 后台下载好的高清模型在这里换上新引擎（在识别线程内做，避免并发用旧 recognizer）
+                if (switchToHdPending) {
+                    switchToHdPending = false;
+                    File hdDir = pendingHdDir;
+                    pendingHdDir = null;
+                    if (hdDir != null) applyHdModel(hdDir);
+                }
+
                 int bytesRead = audioRecord.read(buffer, 0, buffer.length);
                 if (bytesRead < 0) break;
 

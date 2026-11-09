@@ -46,6 +46,7 @@ public class MainActivity extends AppCompatActivity {
     private TextView tvCall;
     private TextView tvPermissions;
     private TextView tvLastNotif;
+    private TextView tvModelStatus;
     private TextView tvSettingsHint;
     private TextView tvDebug;
     private EditText etTime;
@@ -145,6 +146,13 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        findViewById(R.id.btnAsrModel).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showModelChooser();
+            }
+        });
+
         findViewById(R.id.btnAccessibility).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -196,6 +204,7 @@ public class MainActivity extends AppCompatActivity {
         refreshServiceState();
         updatePermissionSummary();
         updateLastNotification();
+        updateModelStatus();
         guideMissingAccess();
     }
 
@@ -384,8 +393,181 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /** 界面重新打开时，把后台期间产生的日志补齐到显示区。 */
-    private void refreshLogFromStore() {
+    // ========== 识别模型 ==========
+
+    private java.io.File hdModelDir() {
+        return new java.io.File(getFilesDir(), "vosk-model-hd");
+    }
+
+    private java.io.File hdArchiveFile() {
+        return new java.io.File(getFilesDir(), "downloads/vosk-model-hd.zip");
+    }
+
+    private boolean isHdModelDownloaded() {
+        return containsFile(hdModelDir(), "final.mdl");
+    }
+
+    private static boolean containsFile(java.io.File dir, String name) {
+        java.io.File[] files = dir == null ? null : dir.listFiles();
+        if (files == null) return false;
+        for (java.io.File f : files) {
+            if (f.isDirectory()) {
+                if (containsFile(f, name)) return true;
+            } else if (f.getName().equals(name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void updateModelStatus() {
+        boolean hd = AppSettings.ASR_MODEL_HD.equals(AppSettings.getAsrModel(this));
+        boolean downloaded = isHdModelDownloaded();
+        String text;
+        if (hd && downloaded) {
+            text = "当前：高清模型（已下载，约 2GB，准确率更高）";
+        } else if (hd) {
+            text = "当前：高清模型（尚未下载，服务会在后台下载约 1.27GB；"
+                    + "下载期间先用标准模型，下载完自动切换）";
+        } else if (downloaded) {
+            text = "当前：标准模型（内置 66MB）；高清模型已下载，可随时切换";
+        } else {
+            text = "当前：标准模型（内置 66MB，省内存）";
+        }
+        if (tvModelStatus != null) tvModelStatus.setText(text);
+    }
+
+    private void showModelChooser() {
+        boolean hd = AppSettings.ASR_MODEL_HD.equals(AppSettings.getAsrModel(this));
+        String[] items = {
+                "标准模型（内置 66MB，够用、省内存）",
+                "高清模型（1.27GB，嘈杂环境、口音重时明显更准）"
+        };
+        final int[] selected = {hd ? 1 : 0};
+        new AlertDialog.Builder(this)
+                .setTitle("选择识别模型")
+                .setSingleChoiceItems(items, selected[0],
+                        (dialog, which) -> selected[0] = which)
+                .setPositiveButton("应用", (dialog, which) -> applyModelChoice(selected[0]))
+                .setNeutralButton("删除高清模型", (dialog, which) -> confirmDeleteHdModel())
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void applyModelChoice(int choice) {
+        boolean hd = choice == 1;
+        if (!hd) {
+            AppSettings.setAsrModel(this, AppSettings.ASR_MODEL_STANDARD);
+            updateModelStatus();
+            restartServiceForModel("正在切换到标准模型...");
+            return;
+        }
+
+        boolean downloaded = isHdModelDownloaded();
+        if (!downloaded) {
+            long freeMb = freeSpaceMb();
+            if (freeMb >= 0 && freeMb < 3500) {
+                Toast.makeText(this, "存储空间不足：下载加解压需要约 3.4GB，当前可用 "
+                        + freeMb + "MB", Toast.LENGTH_LONG).show();
+                return;
+            }
+            long ramMb = totalRamMb();
+            if (ramMb > 0 && ramMb < 3000) {
+                Toast.makeText(this, "这台手机总内存只有 " + ramMb
+                        + "MB，加载高清模型可能导致应用被杀，建议继续用标准模型", Toast.LENGTH_LONG).show();
+            }
+            new AlertDialog.Builder(this)
+                    .setTitle("下载高清模型")
+                    .setMessage("文件约 1.27GB，建议在 Wi-Fi 下进行。\n"
+                            + "下载期间请保持服务运行，中断后下次启动会从断点继续。\n"
+                            + "空间占用：压缩包 1.27GB，解压后约 2.0GB，解压期间共需约 3.4GB；"
+                            + "解压完会自动删除压缩包。\n\n"
+                            + "现在开始下载？")
+                    .setPositiveButton("开始下载", (dialog, w) -> {
+                        AppSettings.setAsrModel(this, AppSettings.ASR_MODEL_HD);
+                        updateModelStatus();
+                        restartServiceForModel("正在准备高清模型，下载进度见状态栏");
+                    })
+                    .setNegativeButton("取消", null)
+                    .show();
+            return;
+        }
+
+        AppSettings.setAsrModel(this, AppSettings.ASR_MODEL_HD);
+        updateModelStatus();
+        restartServiceForModel("正在加载高清模型...");
+    }
+
+    private void restartServiceForModel(String hint) {
+        Toast.makeText(this, hint, Toast.LENGTH_LONG).show();
+        if (serviceRunning) {
+            stopVoiceService();
+            new android.os.Handler(getMainLooper()).postDelayed(this::startVoiceService, 800);
+        } else {
+            startVoiceService();
+        }
+    }
+
+    private void confirmDeleteHdModel() {
+        new AlertDialog.Builder(this)
+                .setTitle("删除高清模型")
+                .setMessage("会删除已下载的高清模型和压缩包（约 1.3GB）。\n"
+                        + "如果正在使用高清模型，会自动切回标准模型并重启服务。")
+                .setPositiveButton("删除", (dialog, which) -> {
+                    boolean wasHd = AppSettings.ASR_MODEL_HD.equals(AppSettings.getAsrModel(this));
+                    deleteRecursive(hdModelDir());
+                    deleteRecursive(new java.io.File(getFilesDir(), "vosk-model-hd.tmp"));
+                    java.io.File archive = hdArchiveFile();
+                    if (archive.exists()) archive.delete();
+                    if (wasHd) {
+                        AppSettings.setAsrModel(this, AppSettings.ASR_MODEL_STANDARD);
+                        restartServiceForModel("已删除高清模型，切回标准模型");
+                    } else {
+                        Toast.makeText(this, "高清模型已删除", Toast.LENGTH_SHORT).show();
+                    }
+                    updateModelStatus();
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private long freeSpaceMb() {
+        try {
+            return new android.os.StatFs(getFilesDir().getAbsolutePath())
+                    .getAvailableBytes() / 1024 / 1024;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    private long totalRamMb() {
+        try {
+            android.app.ActivityManager am =
+                    (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            if (am != null) {
+                android.app.ActivityManager.MemoryInfo info =
+                        new android.app.ActivityManager.MemoryInfo();
+                am.getMemoryInfo(info);
+                return info.totalMem / 1024 / 1024;
+            }
+        } catch (Exception e) {
+            // 拿不到就当未知
+        }
+        return -1;
+    }
+
+    private void deleteRecursive(java.io.File file) {
+        if (file == null || !file.exists()) return;
+        if (file.isDirectory()) {
+            java.io.File[] children = file.listFiles();
+            if (children != null) {
+                for (java.io.File child : children) deleteRecursive(child);
+            }
+        }
+        file.delete();
+    }
+
+    /** 界面重新打开时，把后台期间产生的日志补齐到显示区。 */    private void refreshLogFromStore() {
         String history = LogStore.dump();
         if (history == null || history.isEmpty()) return;
         String[] lines = history.split("\n");

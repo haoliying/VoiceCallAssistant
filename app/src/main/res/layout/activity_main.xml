@@ -112,6 +112,31 @@
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
+                android:text="识别模型"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:textColor="#222222"
+                android:layout_marginBottom="6dp" />
+
+            <TextView
+                android:id="@+id/tvModelStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="当前：标准模型（内置 66MB）"
+                android:textSize="13sp"
+                android:textColor="#444444"
+                android:layout_marginBottom="8dp" />
+
+            <Button
+                android:id="@+id/btnAsrModel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="切换识别模型（标准 / 高清）"
+                android:layout_marginBottom="16dp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
                 android:text="语音指令配置"
                 android:textSize="16sp"
                 android:textStyle="bold"
