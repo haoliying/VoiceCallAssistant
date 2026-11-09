@@ -111,6 +111,7 @@ public class MainActivity extends AppCompatActivity {
         tvLastNotif = findViewById(R.id.tvLastNotif);
         tvSettingsHint = findViewById(R.id.tvSettingsHint);
         tvDebug = findViewById(R.id.tvDebug);
+        tvModelStatus = findViewById(R.id.tvModelStatus);
         etTime = findViewById(R.id.etTimeCommand);
         etAnswer = findViewById(R.id.etAnswerCommand);
         etHangup = findViewById(R.id.etHangupCommand);
