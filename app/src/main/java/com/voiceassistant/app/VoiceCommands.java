@@ -13,11 +13,62 @@ final class VoiceCommands {
     enum Action { NONE, TIME, ANSWER, HANGUP }
 
     /** 用户没改配置时也常用的说法，避免识别差一个字就不响应。 */
-    private static final String[] TIME_SYNONYMS = {"几点了", "几点啦", "现在几点", "什么时间", "现在时间"};
+    private static final String[] TIME_SYNONYMS = {
+            "几点了", "几点啦", "几点", "现在几点", "什么时间", "现在时间", "报时"};
     private static final String[] ANSWER_SYNONYMS = {
-            "接电话", "接听电话", "接听", "接通", "接起来", "接一下电话", "接个电话"};
+            "接电话", "接听电话", "接听", "接通", "接起来", "接一下电话", "接个电话",
+            "接下电话", "接听一下", "帮我接"};
     private static final String[] HANGUP_SYNONYMS = {
             "挂断电话", "挂断", "挂掉电话", "挂掉", "挂电话", "挂了", "结束通话"};
+
+    /**
+     * 同音字归并表：小模型在嘈杂环境里最常犯的错是“同音不同字”，
+     * 例如把“几点了”识别成“机点啦”、“接电话”识别成“接点话”。
+     * 匹配前把两边都映射到同一个代表字，这类错误就不再影响判定。
+     */
+    private static final String[] HOMOPHONE_GROUPS = {
+            "电点店垫典惦淀碘甸",        // diàn / diǎn
+            "接结截街节借届杰洁阶劫",    // jiē / jié
+            "话画化划桦",                // huà
+            "几机鸡基积击迹吉急记挤己技季寄计", // jī / jǐ / jì
+            "了啦乐勒垃喇辣腊",          // le / la
+            "听厅停挺庭亭艇",            // tīng / tíng
+            "挂卦褂寡刮瓜",              // guà / guā
+            "断段锻缎短端煅",            // duàn / duǎn
+            "时十实识石食拾湿失师诗事是使世市试", // shí / shì
+            "间建件见简减检肩坚尖键健箭践荐渐",   // jiān / jiàn
+            "现先线县显险限献陷鲜闲贤嫌",         // xiàn / xiān
+            "在再载哉崽",                // zài
+            "什深身申神审沈伸甚",        // shén / shēn
+            "么末抹魔模摸莫沫",          // me / mo
+            "通同铜童桶筒统",            // tōng / tóng
+            "关观官管馆惯灌冠",          // guān / guàn
+    };
+
+    private static final java.util.Map<Character, Character> HOMOPHONE_MAP = buildHomophoneMap();
+
+    private static java.util.Map<Character, Character> buildHomophoneMap() {
+        java.util.Map<Character, Character> map = new java.util.HashMap<>();
+        for (String group : HOMOPHONE_GROUPS) {
+            char representative = group.charAt(0);
+            for (int i = 0; i < group.length(); i++) {
+                map.put(group.charAt(i), representative);
+            }
+        }
+        return map;
+    }
+
+    /** 把同音字统一成代表字，用于“听起来一样”的匹配。 */
+    static String canonical(String text) {
+        if (text == null || text.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder(text.length());
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            Character mapped = HOMOPHONE_MAP.get(c);
+            sb.append(mapped != null ? mapped.charValue() : c);
+        }
+        return sb.toString();
+    }
 
     private VoiceCommands() {}
 
@@ -30,12 +81,12 @@ final class VoiceCommands {
 
     /** 纯函数版本，方便脱离 Android 环境做匹配测试。 */
     static Action match(String rawText, String timeQueryCfg, String answerCfg, String hangupCfg) {
-        String text = normalize(rawText);
+        String text = canonical(normalize(rawText));
         if (text.isEmpty()) return Action.NONE;
 
-        String timeQuery = normalize(timeQueryCfg);
-        String answer = normalize(answerCfg);
-        String hangup = normalize(hangupCfg);
+        String timeQuery = canonical(normalize(timeQueryCfg));
+        String answer = canonical(normalize(answerCfg));
+        String hangup = canonical(normalize(hangupCfg));
 
         // 用户改过口令就只认新口令；保持默认时才附带同义说法，避免改了以后旧口令仍然生效
         String[] hangupWords = wordsFor(hangup, AppSettings.DEFAULT_HANGUP, HANGUP_SYNONYMS);
@@ -56,7 +107,7 @@ final class VoiceCommands {
     }
 
     private static String[] wordsFor(String config, String defaultWord, String[] synonyms) {
-        if (!config.equals(normalize(defaultWord))) {
+        if (!config.equals(canonical(normalize(defaultWord)))) {
             return new String[]{config};
         }
         return merge(config, synonyms);
@@ -65,7 +116,9 @@ final class VoiceCommands {
     private static String[] merge(String primary, String[] synonyms) {
         String[] result = new String[synonyms.length + 1];
         result[0] = primary;
-        System.arraycopy(synonyms, 0, result, 1, synonyms.length);
+        for (int i = 0; i < synonyms.length; i++) {
+            result[i + 1] = canonical(normalize(synonyms[i]));
+        }
         return result;
     }
 

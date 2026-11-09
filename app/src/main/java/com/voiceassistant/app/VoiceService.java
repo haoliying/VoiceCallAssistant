@@ -120,6 +120,10 @@ public class VoiceService extends Service {
     private Model voskModel;
     private Recognizer recognizer;
     private AudioRecord audioRecord;
+    /** 系统自带的音频效果，能用就挂上，不能用就靠 AudioPreprocessor 的软件降噪。 */
+    private android.media.audiofx.NoiseSuppressor noiseSuppressor;
+    private android.media.audiofx.AcousticEchoCanceler echoCanceler;
+    private android.media.audiofx.AutomaticGainControl automaticGainControl;
 
     // SherpaOnnx (TTS)
     private OfflineTts tts;
@@ -970,7 +974,68 @@ public class VoiceService extends Service {
             audioRecord = null;
             return false;
         }
+        enableAudioEffects();
         return true;
+    }
+
+    /**
+     * 挂上系统自带的降噪/回声消除/自动增益。
+     * 国产 ROM 上经常没有对应实现，失败就静默跳过，后面的软件 DSP 仍然生效。
+     */
+    private void enableAudioEffects() {
+        int session = audioRecord.getAudioSessionId();
+        StringBuilder report = new StringBuilder("[音频] 系统降噪=");
+        try {
+            if (android.media.audiofx.NoiseSuppressor.isAvailable()) {
+                noiseSuppressor = android.media.audiofx.NoiseSuppressor.create(session);
+                if (noiseSuppressor != null) noiseSuppressor.setEnabled(true);
+                report.append(noiseSuppressor != null ? "开" : "创建失败");
+            } else {
+                report.append("不可用");
+            }
+        } catch (Exception e) {
+            report.append("失败");
+        }
+        report.append(" 回声消除=");
+        try {
+            if (android.media.audiofx.AcousticEchoCanceler.isAvailable()) {
+                echoCanceler = android.media.audiofx.AcousticEchoCanceler.create(session);
+                if (echoCanceler != null) echoCanceler.setEnabled(true);
+                report.append(echoCanceler != null ? "开" : "创建失败");
+            } else {
+                report.append("不可用");
+            }
+        } catch (Exception e) {
+            report.append("失败");
+        }
+        report.append(" 自动增益=");
+        try {
+            if (android.media.audiofx.AutomaticGainControl.isAvailable()) {
+                automaticGainControl = android.media.audiofx.AutomaticGainControl.create(session);
+                if (automaticGainControl != null) automaticGainControl.setEnabled(true);
+                report.append(automaticGainControl != null ? "开" : "创建失败");
+            } else {
+                report.append("不可用");
+            }
+        } catch (Exception e) {
+            report.append("失败");
+        }
+        broadcastDebug(report.toString());
+    }
+
+    private void releaseAudioEffects() {
+        if (noiseSuppressor != null) {
+            try { noiseSuppressor.release(); } catch (Exception ignored) { }
+            noiseSuppressor = null;
+        }
+        if (echoCanceler != null) {
+            try { echoCanceler.release(); } catch (Exception ignored) { }
+            echoCanceler = null;
+        }
+        if (automaticGainControl != null) {
+            try { automaticGainControl.release(); } catch (Exception ignored) { }
+            automaticGainControl = null;
+        }
     }
 
     private void startRecognitionLoop() {
@@ -987,6 +1052,9 @@ public class VoiceService extends Service {
                 return;
             }
             byte[] buffer = new byte[8192];
+            short[] samples = new short[8192];
+            AudioPreprocessor preprocessor =
+                    new AudioPreprocessor(SAMPLE_RATE, automaticGainControl == null);
 
             while (isListening) {
                 int bytesRead = audioRecord.read(buffer, 0, buffer.length);
@@ -999,7 +1067,10 @@ public class VoiceService extends Service {
 
                 if (bytesRead > 0 && recognizer != null && modelReady) {
                     try {
-                        if (recognizer.acceptWaveForm(buffer, bytesRead)) {
+                        int count = bytesToShorts(buffer, bytesRead, samples);
+                        // 降噪 + 自动增益在识别线程里做，识别引擎拿到的就是干净信号
+                        preprocessor.process(samples, count);
+                        if (recognizer.acceptWaveForm(samples, count)) {
                             processResult(recognizer.getResult());
                         } else {
                             processPartialResult(recognizer.getPartialResult());
@@ -1011,6 +1082,15 @@ public class VoiceService extends Service {
             }
         });
         recognitionThread.start();
+    }
+
+    /** 小端 16bit PCM 转 short[]，后面交给降噪和识别引擎。 */
+    private static int bytesToShorts(byte[] source, int bytes, short[] dest) {
+        int count = Math.min(bytes / 2, dest.length);
+        for (int i = 0; i < count; i++) {
+            dest[i] = (short) ((source[i * 2] & 0xff) | (source[i * 2 + 1] << 8));
+        }
+        return count;
     }
 
     private void processResult(String resultJson) {
@@ -1957,6 +2037,7 @@ public class VoiceService extends Service {
 
         if (audioRecord != null) {
             try { audioRecord.stop(); } catch (Exception e) { /* ignore */ }
+            releaseAudioEffects();
             audioRecord.release();
             audioRecord = null;
         }
