@@ -42,13 +42,16 @@ public class MainActivity extends AppCompatActivity {
     private Button btnStartStop;
     private Button btnSaveSettings;
     private Button btnPermissions;
+    private Button btnSpeaker;
     private TextView tvStatus;
     private TextView tvCall;
     private TextView tvPermissions;
     private TextView tvLastNotif;
     private TextView tvModelStatus;
+    private TextView tvAudioStatus;
     private TextView tvSettingsHint;
     private TextView tvDebug;
+    private TextView tvVersion;
     private EditText etTime;
     private EditText etAnswer;
     private EditText etHangup;
@@ -112,6 +115,11 @@ public class MainActivity extends AppCompatActivity {
         tvSettingsHint = findViewById(R.id.tvSettingsHint);
         tvDebug = findViewById(R.id.tvDebug);
         tvModelStatus = findViewById(R.id.tvModelStatus);
+        tvAudioStatus = findViewById(R.id.tvAudioStatus);
+        tvVersion = findViewById(R.id.tvVersion);
+        btnSpeaker = findViewById(R.id.btnSpeaker);
+
+        tvVersion.setText("v" + BuildConfig.VERSION_NAME);
         etTime = findViewById(R.id.etTimeCommand);
         etAnswer = findViewById(R.id.etAnswerCommand);
         etHangup = findViewById(R.id.etHangupCommand);
@@ -191,6 +199,33 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        btnSpeaker.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                boolean enabled = !AppSettings.isSpeakerOutput(MainActivity.this);
+                AppSettings.setSpeakerOutput(MainActivity.this, enabled);
+                updateSpeakerButton();
+                Toast.makeText(MainActivity.this,
+                        enabled ? "已改为强制扬声器外放" : "已改为跟随系统当前输出",
+                        Toast.LENGTH_SHORT).show();
+                appendDebug("[音频] " + (enabled ? "强制内置扬声器外放" : "跟随系统当前输出"));
+            }
+        });
+
+        findViewById(R.id.btnTestSpeak).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (!serviceRunning) {
+                    Toast.makeText(MainActivity.this, "请先启动服务，再试听", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                sendServiceAction(VoiceService.ACTION_TEST_SPEAK);
+            }
+        });
+
+        findViewById(R.id.btnHelp).setOnClickListener(v -> showHelp());
+        findViewById(R.id.btnChangelog).setOnClickListener(v -> showChangelog());
+
         requestAllPermissions();
     }
 
@@ -206,6 +241,7 @@ public class MainActivity extends AppCompatActivity {
         updatePermissionSummary();
         updateLastNotification();
         updateModelStatus();
+        updateSpeakerButton();
         guideMissingAccess();
     }
 
@@ -499,6 +535,48 @@ public class MainActivity extends AppCompatActivity {
         restartServiceForModel("正在加载高清模型...");
     }
 
+    private void updateSpeakerButton() {
+        if (btnSpeaker == null) return;
+        boolean on = AppSettings.isSpeakerOutput(this);
+        btnSpeaker.setText(on
+                ? "扬声器外放：已开启（点按改为跟随系统）"
+                : "扬声器外放：跟随系统（点按改为强制外放）");
+        if (tvAudioStatus != null) {
+            tvAudioStatus.setText("播报音量跟随系统媒体音量，媒体音量为 0 时不播报。当前输出："
+                    + (on ? "强制内置扬声器。" : "跟随系统当前设备（蓝牙耳机 / 车机 / 手机喇叭）。"));
+        }
+    }
+
+    private void sendServiceAction(String action) {
+        Intent intent = new Intent(this, VoiceService.class);
+        intent.setAction(action);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent);
+            } else {
+                startService(intent);
+            }
+        } catch (Exception e) {
+            appendDebug("发送指令失败: " + e.getMessage());
+        }
+    }
+
+    private void showHelp() {
+        new AlertDialog.Builder(this)
+                .setTitle("使用帮助")
+                .setMessage(getString(R.string.help_text))
+                .setPositiveButton("知道了", null)
+                .show();
+    }
+
+    private void showChangelog() {
+        new AlertDialog.Builder(this)
+                .setTitle("版本说明 · v" + BuildConfig.VERSION_NAME)
+                .setMessage(getString(R.string.changelog_text))
+                .setPositiveButton("关闭", null)
+                .show();
+    }
+
     private void restartServiceForModel(String hint) {
         Toast.makeText(this, hint, Toast.LENGTH_LONG).show();
         if (serviceRunning) {
@@ -740,6 +818,19 @@ public class MainActivity extends AppCompatActivity {
 
         tvStatus.setText(text);
         btnStartStop.setText(serviceRunning ? "停止服务" : "启动服务");
+
+        // 状态用颜色区分：出错红、运行绿、停止灰蓝
+        int statusColor;
+        if (VoiceService.STATUS_ERROR.equals(status)) {
+            statusColor = R.color.danger;
+        } else if (serviceRunning) {
+            statusColor = R.color.accent;
+        } else {
+            statusColor = R.color.textPrimary;
+        }
+        tvStatus.setTextColor(ContextCompat.getColor(this, statusColor));
+        btnStartStop.setBackgroundTintList(android.content.res.ColorStateList.valueOf(
+                ContextCompat.getColor(this, serviceRunning ? R.color.danger : R.color.primary)));
     }
 
     private void appendDebug(String message) {

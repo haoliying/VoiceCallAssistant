@@ -13,6 +13,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
+import android.media.AudioDeviceInfo;
 import android.media.AudioFocusRequest;
 import android.media.AudioFormat;
 import android.media.AudioManager;
@@ -92,6 +93,9 @@ public class VoiceService extends Service {
     /** 通知栏上的兜底按钮，语音识别不灵时也能接/挂。 */
     private static final String ACTION_ANSWER_CALL = "com.voiceassistant.ANSWER_CALL";
     private static final String ACTION_HANG_UP_CALL = "com.voiceassistant.HANG_UP_CALL";
+
+    /** 界面上的“试听一句”。 */
+    public static final String ACTION_TEST_SPEAK = "com.voiceassistant.TEST_SPEAK";
 
     private static final String TTS_MODEL_URL =
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-zh-hf-theresa.tar.bz2";
@@ -282,6 +286,7 @@ public class VoiceService extends Service {
                     broadcastStatus(STATUS_ERROR);
                     return;
                 }
+                logAudioSettings();
 
                 broadcastDebug("[ok] 全部初始化成功");
                 modelReady = true;
@@ -1107,8 +1112,14 @@ public class VoiceService extends Service {
 
     // ========== Audio Playback ==========
 
-    private void playAudio(float[] samples, int sampleRate) {
-        if (samples == null || samples.length == 0) return;
+    private boolean playAudio(float[] samples, int sampleRate) {
+        if (samples == null || samples.length == 0) return false;
+
+        // 声音跟随系统：媒体音量为 0（或系统静音）就不出声，不在应用里偷偷调音量
+        if (isMediaMuted()) {
+            broadcastDebug("[音频] 系统媒体音量为 0，按“跟随系统”不播报");
+            return false;
+        }
 
         short[] shortSamples = new short[samples.length];
         for (int i = 0; i < samples.length; i++) {
@@ -1145,6 +1156,8 @@ public class VoiceService extends Service {
         );
 
         activeTrack = audioTrack;
+        // 选了“扬声器外放”就把这一条音轨钉在内置喇叭上，耳机/车机连着也念手机喇叭
+        routeToBuiltInSpeaker(audioTrack);
         requestAudioFocus();
         try {
             audioTrack.play();
@@ -1172,6 +1185,7 @@ public class VoiceService extends Service {
             try { audioTrack.release(); } catch (Exception ignored) { }
             abandonAudioFocus();
         }
+        return true;
     }
 
     /** 立即停止正在播放的播报（例如来电已经挂断）。 */
@@ -1185,6 +1199,63 @@ public class VoiceService extends Service {
         } catch (Exception e) {
             Log.w(TAG, "stopPlayback failed", e);
         }
+    }
+
+    /** 系统媒体音量被调到 0 或静音时，按“跟随系统”不出声，也不偷偷把音量调上去。 */
+    private boolean isMediaMuted() {
+        if (audioManager == null) return false;
+        try {
+            if (audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) <= 0) return true;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                    && audioManager.isStreamMute(AudioManager.STREAM_MUSIC)) return true;
+        } catch (Exception e) {
+            Log.w(TAG, "read media volume failed", e);
+        }
+        return false;
+    }
+
+    /**
+     * “扬声器外放”开关：只把当前这一条音轨钉到内置喇叭（AudioTrack#setPreferredDevice），
+     * 不动系统的音频模式和外放状态，播完就随音轨一起释放，不会影响别的应用和通话。
+     */
+    private void routeToBuiltInSpeaker(AudioTrack track) {
+        if (audioManager == null || track == null) return;
+        if (!AppSettings.isSpeakerOutput(this)) return;
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
+        try {
+            AudioDeviceInfo speaker = null;
+            for (AudioDeviceInfo device : audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                if (device.getType() == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
+                    speaker = device;
+                    break;
+                }
+            }
+            if (speaker == null) {
+                broadcastDebug("[音频] 没找到内置扬声器，按系统当前输出播报");
+                return;
+            }
+            boolean ok = track.setPreferredDevice(speaker);
+            broadcastDebug("[音频] 扬声器外放：" + (ok ? "已切到内置喇叭" : "切换失败，按系统当前输出"));
+        } catch (Exception e) {
+            Log.w(TAG, "route to speaker failed", e);
+        }
+    }
+
+    /** 启动时把当前声音设置打一行日志，方便确认是“跟随系统”还是“强制外放”。 */
+    private void logAudioSettings() {
+        if (audioManager == null) return;
+        int volume = -1;
+        int max = -1;
+        try {
+            volume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+            max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        } catch (Exception e) {
+            Log.w(TAG, "read volume failed", e);
+        }
+        broadcastDebug("[音频] 播报音量跟随系统媒体音量"
+                + (max > 0 ? "（当前 " + volume + "/" + max + "）" : "")
+                + (isMediaMuted() ? "，现在是静音，播报会跳过" : "")
+                + "；输出=" + (AppSettings.isSpeakerOutput(this) ? "强制内置扬声器" : "跟随系统当前设备"));
     }
 
     // ========== Audio Focus ==========
@@ -1528,8 +1599,9 @@ public class VoiceService extends Service {
                                 currentSpeechText = text;
                                 // 只在真正放音时关麦克风：合成本身不出声，这几秒还是要听指令
                                 speaking = true;
-                                playAudio(audio.getSamples(), audio.getSampleRate());
-                                broadcastDebug("[tts-ok] 播报完成");
+                                if (playAudio(audio.getSamples(), audio.getSampleRate())) {
+                                    broadcastDebug("[tts-ok] 播报完成");
+                                }
                             }
                         } else {
                             broadcastDebug("[tts-error] 生成音频失败");
@@ -1941,8 +2013,9 @@ public class VoiceService extends Service {
                                 && epoch == speechEpoch && !abortSpeech) {
                             currentSpeechText = digits + "来电话";
                             speaking = true;
-                            playAudio(audio, ttsCacheRate);
-                            broadcastDebug("[tts-ok] 号码播报完成");
+                            if (playAudio(audio, ttsCacheRate)) {
+                                broadcastDebug("[tts-ok] 号码播报完成");
+                            }
                         } else if (abortSpeech) {
                             broadcastDebug("[tts] 已收到指令，跳过本次播报");
                         }
@@ -2225,6 +2298,12 @@ public class VoiceService extends Service {
                 answerIncomingCall();
             } else if (ACTION_HANG_UP_CALL.equals(action)) {
                 hangUpCall();
+            } else if (ACTION_TEST_SPEAK.equals(action)) {
+                if (ttsReady && !speaking) {
+                    speak("你好，我是语音电话助手，现在的声音正常。");
+                } else {
+                    broadcastDebug("[tts] 现在还不能试听，等状态变成“监听中”再试");
+                }
             }
         }
         // 前台通知已经在 onCreate 中启动，这里只需要保证进程被系统回收后能自动恢复

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="primary">#6E9BFF</color>
+    <color name="primaryDark">#2F6BFF</color>
+    <color name="accent">#2BD4A0</color>
+    <color name="danger">#FF6B6B</color>
+
+    <color name="bg">#0F1318</color>
+    <color name="surface">#191F26</color>
+    <color name="cardStroke">#2A323C</color>
+
+    <color name="textPrimary">#E8EDF4</color>
+    <color name="textSecondary">#9AA6B5</color>
+    <color name="textTertiary">#75808F</color>
+
+    <color name="logBg">#060A0F</color>
+    <color name="logText">#C3CEDA</color>
+
+    <color name="pillIdleBg">#1E2A42</color>
+    <color name="pillIdleText">#9DBCFF</color>
+</resources>

@@ -20,6 +20,7 @@ final class AppSettings {
     private static final String KEY_HANGUP = "cmd_hangup";
     private static final String KEY_ANNOUNCE_CALLER = "announce_caller";
     private static final String KEY_ASR_MODEL = "asr_model";
+    private static final String KEY_SPEAKER_OUTPUT = "speaker_output";
 
     /** 内置的 66MB 小模型，够用、占内存少。 */
     static final String ASR_MODEL_STANDARD = "standard";
@@ -58,6 +59,15 @@ final class AppSettings {
                 .putString(KEY_ASR_MODEL,
                         ASR_MODEL_HD.equals(model) ? ASR_MODEL_HD : ASR_MODEL_STANDARD)
                 .apply();
+    }
+
+    /** true=强制用手机喇叭外放；false=跟随系统当前输出设备（蓝牙耳机、车机等）。 */
+    static boolean isSpeakerOutput(Context context) {
+        return prefs(context).getBoolean(KEY_SPEAKER_OUTPUT, false);
+    }
+
+    static void setSpeakerOutput(Context context, boolean enabled) {
+        prefs(context).edit().putBoolean(KEY_SPEAKER_OUTPUT, enabled).apply();
     }
 
     static void save(Context context, String timeQuery, String answer, String hangup,
