@@ -33,6 +33,12 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".DocActivity"
+            android:exported="false"
+            android:theme="@style/Theme.VoiceAssistant.Doc"
+            android:parentActivityName=".MainActivity" />
+
         <service
             android:name=".VoiceService"
             android:foregroundServiceType="microphone"

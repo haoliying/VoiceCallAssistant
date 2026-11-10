@@ -14,6 +14,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.text.TextUtils;
+import android.view.MenuItem;
 import android.view.View;
 import android.widget.Button;
 import android.widget.CheckBox;
@@ -26,6 +27,9 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
+
+import com.google.android.material.appbar.MaterialToolbar;
+import com.google.android.material.switchmaterial.SwitchMaterial;
 
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -42,22 +46,27 @@ public class MainActivity extends AppCompatActivity {
     private Button btnStartStop;
     private Button btnSaveSettings;
     private Button btnPermissions;
-    private Button btnSpeaker;
+    private SwitchMaterial swSpeaker;
     private TextView tvStatus;
     private TextView tvCall;
     private TextView tvPermissions;
     private TextView tvLastNotif;
     private TextView tvModelStatus;
     private TextView tvAudioStatus;
+    private TextView tvA11yStatus;
+    private TextView tvNotifStatus;
+    private TextView tvScreeningStatus;
+    private View statusDot;
     private TextView tvSettingsHint;
     private TextView tvDebug;
-    private TextView tvVersion;
     private EditText etTime;
     private EditText etAnswer;
     private EditText etHangup;
     private CheckBox cbAnnounce;
 
     private boolean serviceRunning = false;
+    /** 代码里回填开关状态时不要触发保存逻辑。 */
+    private boolean suppressSpeakerCallback = false;
     /** 本次打开应用已经引导过的权限页，避免用户返回后又被弹走。 */
     private final java.util.Set<String> guidedSteps = new java.util.HashSet<>();
     private final StringBuilder debugLog = new StringBuilder();
@@ -116,10 +125,20 @@ public class MainActivity extends AppCompatActivity {
         tvDebug = findViewById(R.id.tvDebug);
         tvModelStatus = findViewById(R.id.tvModelStatus);
         tvAudioStatus = findViewById(R.id.tvAudioStatus);
-        tvVersion = findViewById(R.id.tvVersion);
-        btnSpeaker = findViewById(R.id.btnSpeaker);
+        tvA11yStatus = findViewById(R.id.tvA11yStatus);
+        tvNotifStatus = findViewById(R.id.tvNotifStatus);
+        tvScreeningStatus = findViewById(R.id.tvScreeningStatus);
+        statusDot = findViewById(R.id.statusDot);
+        swSpeaker = findViewById(R.id.swSpeaker);
 
-        tvVersion.setText("v" + BuildConfig.VERSION_NAME);
+        MaterialToolbar toolbar = findViewById(R.id.toolbar);
+        toolbar.setTitle(R.string.app_name);
+        toolbar.inflateMenu(R.menu.menu_main);
+        toolbar.setOnMenuItemClickListener(this::onMenuItemClick);
+
+        TextView footer = findViewById(R.id.tvFooter);
+        footer.setText("v" + BuildConfig.VERSION_NAME + " · github.com/haoliying/VoiceCallAssistant");
+        footer.setOnClickListener(v -> openDoc(DocActivity.DOC_CHANGELOG));
         etTime = findViewById(R.id.etTimeCommand);
         etAnswer = findViewById(R.id.etAnswerCommand);
         etHangup = findViewById(R.id.etHangupCommand);
@@ -199,17 +218,11 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-        btnSpeaker.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                boolean enabled = !AppSettings.isSpeakerOutput(MainActivity.this);
-                AppSettings.setSpeakerOutput(MainActivity.this, enabled);
-                updateSpeakerButton();
-                Toast.makeText(MainActivity.this,
-                        enabled ? "已改为强制扬声器外放" : "已改为跟随系统当前输出",
-                        Toast.LENGTH_SHORT).show();
-                appendDebug("[音频] " + (enabled ? "强制内置扬声器外放" : "跟随系统当前输出"));
-            }
+        swSpeaker.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (suppressSpeakerCallback) return;
+            AppSettings.setSpeakerOutput(MainActivity.this, isChecked);
+            updateSpeakerButton();
+            appendDebug("[音频] " + (isChecked ? "强制内置扬声器外放" : "跟随系统当前输出"));
         });
 
         findViewById(R.id.btnTestSpeak).setOnClickListener(new View.OnClickListener() {
@@ -223,8 +236,6 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-        findViewById(R.id.btnHelp).setOnClickListener(v -> showHelp());
-        findViewById(R.id.btnChangelog).setOnClickListener(v -> showChangelog());
 
         requestAllPermissions();
     }
@@ -332,23 +343,45 @@ public class MainActivity extends AppCompatActivity {
         boolean notif = CallNotificationListener.isEnabled(this);
         boolean a11y = CallAccessibilityService.isEnabledInSettings(this);
         boolean a11yRunning = CallAccessibilityService.isRunning();
-        StringBuilder sb = new StringBuilder();
-        sb.append("必开：\n");
-        sb.append("  录音：").append(stateOf(Manifest.permission.RECORD_AUDIO));
-        sb.append("  电话状态：").append(stateOf(Manifest.permission.READ_PHONE_STATE));
-        sb.append("  接听电话：").append(stateOf(Manifest.permission.ANSWER_PHONE_CALLS));
-        sb.append("\n  无障碍服务：").append(!a11y ? "未开启（不开启就无法自动接听）"
-                : (a11yRunning ? "已连接（靠它点/划接听）"
-                    : "已开启但没连上，去无障碍里关掉再开一次"));
-        sb.append("\n  通知使用权：").append(notif ? "已开启（优先用通知里的姓名和按钮）" : "未开启（拿不到姓名和通知按钮）");
-        sb.append("\n建议开启：\n");
-        sb.append("  通讯录：").append(stateOf(Manifest.permission.READ_CONTACTS))
-                .append("（把来电号码换成姓名，只查这一个号码）");
-        sb.append("\n  通话记录：").append(stateOf(Manifest.permission.READ_CALL_LOG))
-                .append("（通讯录没找到时补姓名）");
-        sb.append("  拨打电话：").append(stateOf(Manifest.permission.CALL_PHONE));
-        sb.append("\n  来电筛选：").append(IncomingCallScreeningService.isEnabled(this) ? "已开启" : "未开启");
-        tvPermissions.setText(sb.toString());
+        boolean screening = IncomingCallScreeningService.isEnabled(this);
+
+        StringBuilder missing = new StringBuilder();
+        int granted = 0;
+        List<String> names = new ArrayList<>();
+        String[] required = requiredPermissions();
+        for (String permission : required) {
+            String label = permissionLabel(permission);
+            if (ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED) {
+                granted++;
+            } else {
+                names.add(label);
+            }
+        }
+        for (String name : names) {
+            if (missing.length() > 0) missing.append("、");
+            missing.append(name);
+        }
+        int total = required.length;
+        tvPermissions.setText(missing.length() == 0
+                ? "已全部授权（" + total + "/" + total + "）"
+                : "已授权 " + granted + "/" + total + "，缺：" + missing);
+
+        tvA11yStatus.setText(!a11y ? "未开启（不开启就无法自动接听）"
+                : (a11yRunning ? "已连接" : "已开启但没连上，关掉再开一次"));
+        tvNotifStatus.setText(notif ? "已开启" : "未开启（拿不到姓名和通知按钮）");
+        tvScreeningStatus.setText(screening ? "已开启" : "未开启（不影响语音接听）");
+    }
+
+    private static String permissionLabel(String permission) {
+        switch (permission) {
+            case Manifest.permission.RECORD_AUDIO: return "录音";
+            case Manifest.permission.READ_PHONE_STATE: return "电话状态";
+            case Manifest.permission.ANSWER_PHONE_CALLS: return "接听电话";
+            case Manifest.permission.READ_CONTACTS: return "通讯录";
+            case Manifest.permission.READ_CALL_LOG: return "通话记录";
+            case Manifest.permission.CALL_PHONE: return "拨打电话";
+            default: return permission;
+        }
     }
 
     /**
@@ -399,7 +432,7 @@ public class MainActivity extends AppCompatActivity {
     /** 显示最近一条来电通知的原文，方便确认“到底读到了什么”。 */
     private void updateLastNotification() {
         String raw = CallNotificationListener.lastRaw();
-        tvLastNotif.setText("最近来电通知：" + (raw == null || raw.isEmpty() ? "暂无" : raw));
+        tvLastNotif.setText(raw == null || raw.isEmpty() ? "暂无（华为等机型可能不发可读通知）" : raw);
     }
 
     private String stateOf(String permission) {
@@ -536,14 +569,13 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void updateSpeakerButton() {
-        if (btnSpeaker == null) return;
         boolean on = AppSettings.isSpeakerOutput(this);
-        btnSpeaker.setText(on
-                ? "扬声器外放：已开启（点按改为跟随系统）"
-                : "扬声器外放：跟随系统（点按改为强制外放）");
+        suppressSpeakerCallback = true;
+        if (swSpeaker != null) swSpeaker.setChecked(on);
+        suppressSpeakerCallback = false;
         if (tvAudioStatus != null) {
-            tvAudioStatus.setText("播报音量跟随系统媒体音量，媒体音量为 0 时不播报。当前输出："
-                    + (on ? "强制内置扬声器。" : "跟随系统当前设备（蓝牙耳机 / 车机 / 手机喇叭）。"));
+            tvAudioStatus.setText("跟随系统媒体音量，静音时不播报；当前输出："
+                    + (on ? "强制内置扬声器" : "系统当前设备（蓝牙 / 耳机 / 喇叭）"));
         }
     }
 
@@ -561,20 +593,32 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void showHelp() {
-        new AlertDialog.Builder(this)
-                .setTitle("使用帮助")
-                .setMessage(getString(R.string.help_text))
-                .setPositiveButton("知道了", null)
-                .show();
+    private boolean onMenuItemClick(MenuItem item) {
+        int id = item.getItemId();
+        if (id == R.id.action_help) {
+            openDoc(DocActivity.DOC_HELP);
+            return true;
+        }
+        if (id == R.id.action_changelog) {
+            openDoc(DocActivity.DOC_CHANGELOG);
+            return true;
+        }
+        if (id == R.id.action_repo) {
+            try {
+                startActivity(new Intent(Intent.ACTION_VIEW,
+                        android.net.Uri.parse("https://github.com/haoliying/VoiceCallAssistant")));
+            } catch (Exception e) {
+                Toast.makeText(this, "没有可用的浏览器", Toast.LENGTH_SHORT).show();
+            }
+            return true;
+        }
+        return false;
     }
 
-    private void showChangelog() {
-        new AlertDialog.Builder(this)
-                .setTitle("版本说明 · v" + BuildConfig.VERSION_NAME)
-                .setMessage(getString(R.string.changelog_text))
-                .setPositiveButton("关闭", null)
-                .show();
+    private void openDoc(String doc) {
+        Intent intent = new Intent(this, DocActivity.class);
+        intent.putExtra(DocActivity.EXTRA_DOC, doc);
+        startActivity(intent);
     }
 
     private void restartServiceForModel(String hint) {
@@ -831,6 +875,21 @@ public class MainActivity extends AppCompatActivity {
         tvStatus.setTextColor(ContextCompat.getColor(this, statusColor));
         btnStartStop.setBackgroundTintList(android.content.res.ColorStateList.valueOf(
                 ContextCompat.getColor(this, serviceRunning ? R.color.danger : R.color.primary)));
+
+        int dotColor;
+        if (VoiceService.STATUS_ERROR.equals(status)) {
+            dotColor = R.color.danger;
+        } else if (VoiceService.STATUS_LOADING.equals(status)) {
+            dotColor = R.color.primary;
+        } else if (serviceRunning) {
+            dotColor = R.color.accent;
+        } else {
+            dotColor = R.color.textTertiary;
+        }
+        if (statusDot != null) {
+            statusDot.setBackgroundTintList(android.content.res.ColorStateList.valueOf(
+                    ContextCompat.getColor(this, dotColor)));
+        }
     }
 
     private void appendDebug(String message) {

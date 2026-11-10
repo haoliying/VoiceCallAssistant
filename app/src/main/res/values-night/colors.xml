@@ -5,6 +5,9 @@
     <color name="accent">#2BD4A0</color>
     <color name="danger">#FF6B6B</color>
 
+    <color name="appBar">#161C24</color>
+    <color name="appBarText">#E8EDF4</color>
+
     <color name="bg">#0F1318</color>
     <color name="surface">#191F26</color>
     <color name="cardStroke">#2A323C</color>
